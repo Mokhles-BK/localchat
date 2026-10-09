@@ -1,0 +1,6 @@
+{
+  "name": "localchat",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Ollama-style local chatbot (Phase 1 — Foundation)"
+}
