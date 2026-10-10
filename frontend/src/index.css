@@ -21,3 +21,125 @@ body {
 .scroll-thin::-webkit-scrollbar-track {
   @apply bg-transparent;
 }
+
+/* Markdown rendering inside message bubbles. */
+.markdown {
+  @apply text-zinc-100;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+}
+
+.markdown p + p {
+  @apply mt-3;
+}
+
+.markdown pre {
+  background-color: #09090b;
+  border: 1px solid #27272a;
+  border-radius: 0.5rem;
+  padding: 1rem;
+  margin: 0.75rem 0;
+  overflow-x: auto;
+}
+
+.markdown pre::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.markdown pre::-webkit-scrollbar-thumb {
+  background-color: #3f3f46;
+  border-radius: 9999px;
+}
+.markdown pre::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.markdown pre code {
+  background: none;
+  padding: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  white-space: pre;
+}
+
+.markdown code:not(.hljs) {
+  @apply bg-zinc-800 rounded px-1 py-0.5 text-[0.85em];
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.markdown ul {
+  @apply list-disc;
+  margin: 0.75rem 0;
+  padding-left: 1.25rem;
+}
+
+.markdown ol {
+  @apply list-decimal;
+  margin: 0.75rem 0;
+  padding-left: 1.25rem;
+}
+
+.markdown ul ul,
+.markdown ol ol,
+.markdown ul ol,
+.markdown ol ul {
+  margin-top: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.markdown li {
+  @apply my-1;
+}
+
+.markdown li > p {
+  @apply my-0;
+}
+
+.markdown h1 {
+  @apply mt-4 mb-2 text-xl font-bold;
+}
+
+.markdown h2 {
+  @apply mt-4 mb-2 text-lg font-bold;
+}
+
+.markdown h3 {
+  @apply mt-3 mb-1 text-base font-semibold;
+}
+
+.markdown h4 {
+  @apply mt-3 mb-1 text-sm font-semibold;
+}
+
+.markdown a {
+  @apply text-emerald-400 underline underline-offset-2;
+}
+
+.markdown table {
+  @apply block overflow-x-auto border border-zinc-800 rounded-lg;
+  margin: 0.75rem 0;
+}
+
+.markdown thead {
+  @apply bg-zinc-900;
+}
+
+.markdown th,
+.markdown td {
+  @apply border border-zinc-800 px-3 py-2 text-left align-top;
+}
+
+.markdown th {
+  @apply font-semibold;
+}
+
+.markdown tr + tr td {
+  @apply border-t;
+}
+
+.markdown blockquote {
+  @apply border-l-2 border-zinc-700 bg-zinc-900/50 pl-3 py-1;
+  margin: 0.75rem 0;
+  color: #a1a1aa;
+}

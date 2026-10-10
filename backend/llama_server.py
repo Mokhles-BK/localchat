@@ -75,6 +75,7 @@ class LlamaServer:
         if not self.model.exists():
             raise FileNotFoundError(f"model file not found: {self.model}")
 
+        ctx_size = int(os.environ.get("LLAMA_CTX_SIZE", "4096"))
         cmd = [
             str(self.binary),
             "--model",
@@ -85,6 +86,8 @@ class LlamaServer:
             str(self.port),
             "-ngl",
             str(self.n_gpu_layers),
+            "--ctx-size",
+            str(ctx_size),
         ]
         cmd.extend(self.extra_args)
 

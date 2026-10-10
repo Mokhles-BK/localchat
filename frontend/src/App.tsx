@@ -97,8 +97,8 @@ export default function App() {
       </header>
 
       {/* Messages */}
-      <div ref={listRef} className="scroll-thin flex-1 overflow-y-auto px-4 py-6">
-        <div className="mx-auto flex w-full max-w-2xl flex-col gap-5">
+      <div ref={listRef} className="scroll-thin flex-1 min-w-0 overflow-y-auto px-4 py-6">
+        <div className="mx-auto flex w-full max-w-2xl min-w-0 flex-col gap-5">
           {messages.length === 0 && !busy && (
             <div className="py-10 text-center text-zinc-600">
               <p className="text-base text-zinc-400">LocalChat is ready.</p>
@@ -106,13 +106,13 @@ export default function App() {
             </div>
           )}
           {messages.map((m, i) => (
-            <div key={i} className="flex flex-col gap-1">
+            <div key={i} className="flex min-w-0 flex-col gap-1">
               <span className="px-1 text-xs font-medium uppercase tracking-wide text-zinc-500">
                 {m.role}
               </span>
-              <div className="rounded-2xl bg-zinc-900 px-4 py-3 text-sm leading-relaxed text-zinc-100">
+              <div className="min-w-0 max-w-full overflow-hidden rounded-2xl bg-zinc-900 px-4 py-3 text-sm leading-relaxed text-zinc-100">
                 {m.content ? (
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                  <ReactMarkdown className="markdown" remarkPlugins={[remarkGfm]}>
                     {m.content}
                   </ReactMarkdown>
                 ) : (
