@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 
-from context import trim_messages
+from context import ctx_size, estimate_tokens, trim_messages
 import storage
 
 
@@ -34,7 +34,8 @@ def build_context(conv: dict, history: list[dict], new_user_text: str | None) ->
     messages: list[dict] = []
     if conv.get("system_prompt"):
         messages.append({"role": "system", "content": conv["system_prompt"]})
-    messages.extend(history)
+    # History rows also carry id/meta for the UI; the model gets role+content only.
+    messages.extend({"role": m["role"], "content": m["content"]} for m in history)
     if new_user_text:
         messages.append({"role": "user", "content": new_user_text})
     return trim_messages(messages)
@@ -55,3 +56,32 @@ def effective_settings(conv: dict, req) -> dict:
     if settings["max_tokens"] == -1:
         settings["max_tokens"] = 1024
     return settings
+
+def reply_meta(
+    pieces: list[str],
+    stats: dict,
+    messages: list[dict],
+    t_first: float | None,
+    t_last: float | None,
+) -> dict:
+    """Token counts and speed for one reply, saved with the assistant message.
+
+    Prefers llama-server's own numbers (``usage`` / ``timings``); falls back to
+    counting streamed pieces and timing them (marked ``exact: false``).
+    """
+    usage = stats.get("usage") or {}
+    timings = stats.get("timings") or {}
+    tokens = usage.get("completion_tokens") or timings.get("predicted_n") or len(pieces)
+    prompt = usage.get("prompt_tokens") or timings.get("prompt_n") or estimate_tokens(messages)
+    tps = timings.get("predicted_per_second")
+    if not tps and t_first is not None and t_last is not None and tokens > 1 and t_last - t_first > 0.05:
+        tps = (tokens - 1) / (t_last - t_first)
+    meta: dict = {
+        "tokens": int(tokens),
+        "prompt_tokens": int(prompt),
+        "ctx": ctx_size(),
+        "exact": bool(usage or timings),
+    }
+    if tps:
+        meta["tps"] = round(float(tps), 1)
+    return meta

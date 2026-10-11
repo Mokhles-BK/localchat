@@ -1,5 +1,5 @@
-import { useState } from "react";
-import type { Conversation } from "../lib/api";
+import { useEffect, useState } from "react";
+import { api, type Conversation, type SearchHit } from "../lib/api";
 
 interface Props {
   conversations: Conversation[];
@@ -13,6 +13,32 @@ interface Props {
 export default function Sidebar({ conversations, activeId, onSelect, onNew, onRename, onDelete }: Props) {
   const [editingId, setEditingId] = useState<number | null>(null);
   const [draft, setDraft] = useState("");
+  const [query, setQuery] = useState("");
+  const [hits, setHits] = useState<SearchHit[] | null>(null);
+
+  // Debounced search across titles and message text.
+  useEffect(() => {
+    const q = query.trim();
+    if (!q) {
+      setHits(null);
+      return;
+    }
+    let stale = false;
+    const t = window.setTimeout(() => {
+      api
+        .search(q)
+        .then((r) => {
+          if (!stale) setHits(r);
+        })
+        .catch(() => {
+          if (!stale) setHits([]);
+        });
+    }, 250);
+    return () => {
+      stale = true;
+      window.clearTimeout(t);
+    };
+  }, [query]);
 
   function startRename(c: Conversation) {
     setEditingId(c.id);
@@ -38,11 +64,41 @@ export default function Sidebar({ conversations, activeId, onSelect, onNew, onRe
           + New chat
         </button>
       </div>
+      <div className="px-3 pb-2">
+        <input
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={(e) => e.key === "Escape" && setQuery("")}
+          placeholder="Search chats…"
+          className="w-full rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 outline-none focus:border-emerald-600"
+        />
+      </div>
       <div className="scroll-thin flex-1 overflow-y-auto px-2 pb-3">
-        {conversations.length === 0 && (
+        {hits !== null && (
+          <div>
+            {hits.length === 0 && <p className="px-3 py-4 text-xs text-zinc-600">No matches.</p>}
+            {hits.map((h, i) => (
+              <button
+                key={`${h.conversation_id}-${h.message_id ?? "t"}-${i}`}
+                onClick={() => {
+                  onSelect(h.conversation_id);
+                  setQuery("");
+                }}
+                className="mb-1 block w-full rounded-lg px-3 py-2 text-left hover:bg-zinc-900"
+              >
+                <div className="truncate text-xs font-medium text-zinc-300">{h.title || "New chat"}</div>
+                <div className="mt-0.5 line-clamp-2 text-xs text-zinc-500">
+                  {h.role ? `${h.role === "user" ? "You" : "AI"}: ` : "Title: "}
+                  {h.snippet}
+                </div>
+              </button>
+            ))}
+          </div>
+        )}
+        {hits === null && conversations.length === 0 && (
           <p className="px-3 py-4 text-xs text-zinc-600">No conversations yet.</p>
         )}
-        {conversations.map((c) => {
+        {hits === null && conversations.map((c) => {
           const active = c.id === activeId;
           return (
             <div

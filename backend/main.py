@@ -16,6 +16,7 @@ import json
 import os
 import signal
 import sys
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
@@ -26,11 +27,12 @@ from fastapi.responses import StreamingResponse
 
 import model_manager
 from llama_server import LlamaServer
-from routes_conversations import router
+from routes_conversations import router, search_router
 from routes_models import router as models_router
 from schemas import ChatRequest
 import storage
-from chat_service import build_context, effective_settings
+from chat_service import build_context, effective_settings, reply_meta
+from context import ctx_size
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 MODELS_DIR = DATA_DIR / "models"
@@ -126,6 +128,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(router)
+app.include_router(search_router)
 app.include_router(models_router)
 
 
@@ -150,6 +153,7 @@ def health() -> dict[str, Any]:
         "llama_server_detail": server_detail,
         "model": _server.model.name if _server else None,
         "loading_model": _loading_model,
+        "ctx_size": ctx_size(),
         "log_file": str(_server.log_path) if _server else None,
         **_model_status(),
     }
@@ -190,7 +194,18 @@ async def chat(req: ChatRequest) -> StreamingResponse:
 
     settings = effective_settings(conv, req)
 
-    if req.regenerate:
+    if req.edit_message_id is not None:
+        # Edit a user message: new text, drop everything after it, re-answer.
+        target = storage.get_message(req.edit_message_id)
+        if target is None or target["conversation_id"] != req.conversation_id:
+            raise HTTPException(status_code=404, detail="message not found")
+        if target["role"] != "user":
+            raise HTTPException(status_code=400, detail="only user messages can be edited")
+        if not req.content.strip():
+            raise HTTPException(status_code=400, detail="content is required")
+        storage.update_message_content(target["id"], req.content)
+        storage.delete_messages_after(req.conversation_id, target["id"])
+    elif req.regenerate:
         # Re-answer from the stored history; needs an assistant reply to drop.
         if not any(m["role"] == "assistant" for m in storage.list_messages(req.conversation_id)):
             raise HTTPException(status_code=400, detail="nothing to regenerate")
@@ -208,6 +223,9 @@ async def chat(req: ChatRequest) -> StreamingResponse:
 
     async def event_generator():
         sink: list[str] = []
+        stats: dict = {}
+        t_first: float | None = None
+        t_last: float | None = None
         try:
             async for data in server.chat_stream_async(
                 messages,
@@ -215,7 +233,11 @@ async def chat(req: ChatRequest) -> StreamingResponse:
                 top_p=settings["top_p"],
                 max_tokens=settings["max_tokens"],
                 sink=sink,
+                stats=stats,
             ):
+                t_last = time.monotonic()
+                if t_first is None:
+                    t_first = t_last
                 yield f"data: {data}\n\n"
             yield "data: [DONE]\n\n"
         except Exception as exc:  # noqa: BLE001
@@ -225,7 +247,8 @@ async def chat(req: ChatRequest) -> StreamingResponse:
             # Runs on completion, error AND client-disconnect cancellation.
             text = "".join(sink)
             if text.strip():
-                storage.add_message(req.conversation_id, "assistant", text)
+                meta = reply_meta(sink, stats, messages, t_first, t_last)
+                storage.add_message(req.conversation_id, "assistant", text, meta)
 
     return StreamingResponse(
         event_generator(),

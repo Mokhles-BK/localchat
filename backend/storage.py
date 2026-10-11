@@ -26,6 +26,7 @@ messages
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import time
@@ -84,6 +85,10 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             ON messages(conversation_id, created_at);
         """
     )
+    # Migration: per-message metadata (token counts, speed) added in Phase 4.
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(messages)")}
+    if "meta" not in cols:
+        conn.execute("ALTER TABLE messages ADD COLUMN meta TEXT")
     conn.commit()
 
 
@@ -179,21 +184,142 @@ def list_messages(conv_id: int) -> list[dict]:
     messages share the same second (created_at is only second-resolution)."""
     conn = _get_conn()
     rows = conn.execute(
-        "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY created_at ASC, id ASC",
+        "SELECT id, role, content, meta FROM messages WHERE conversation_id = ? ORDER BY created_at ASC, id ASC",
         (conv_id,),
     ).fetchall()
-    return [dict(r) for r in rows]
+    return [_message_dict(r) for r in rows]
 
 
-def add_message(conv_id: int, role: str, content: str) -> dict:
+def _message_dict(row: sqlite3.Row) -> dict:
+    meta = None
+    if row["meta"]:
+        try:
+            meta = json.loads(row["meta"])
+        except ValueError:
+            meta = None
+    return {"id": row["id"], "role": row["role"], "content": row["content"], "meta": meta}
+
+
+def add_message(conv_id: int, role: str, content: str, meta: Optional[dict] = None) -> dict:
     conn = _get_conn()
     now = int(time.time())
     cur = conn.execute(
-        "INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-        (conv_id, role, content, now),
+        "INSERT INTO messages (conversation_id, role, content, created_at, meta) VALUES (?, ?, ?, ?, ?)",
+        (conv_id, role, content, now, json.dumps(meta) if meta else None),
     )
     conn.commit()
-    return {"id": cur.lastrowid, "conversation_id": conv_id, "role": role, "content": content}
+    return {"id": cur.lastrowid, "conversation_id": conv_id, "role": role, "content": content, "meta": meta}
+
+
+def get_message(msg_id: int) -> Optional[dict]:
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT id, conversation_id, role, content, meta FROM messages WHERE id = ?", (msg_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    d = _message_dict(row)
+    d["conversation_id"] = row["conversation_id"]
+    return d
+
+
+def update_message_content(msg_id: int, content: str) -> bool:
+    """Replace a message's text; its old metadata no longer applies, so it is cleared."""
+    conn = _get_conn()
+    cur = conn.execute("UPDATE messages SET content = ?, meta = NULL WHERE id = ?", (content, msg_id))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def delete_messages_after(conv_id: int, msg_id: int) -> int:
+    """Delete every message of the conversation that comes after `msg_id`."""
+    conn = _get_conn()
+    cur = conn.execute(
+        "DELETE FROM messages WHERE conversation_id = ? AND id > ?", (conv_id, msg_id)
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+def fork_conversation(conv_id: int, up_to_message_id: int) -> Optional[dict]:
+    """Copy a conversation (settings + messages up to and including a message)
+    into a new one, so the user can try a different direction from that point."""
+    src = get_conversation(conv_id)
+    last = get_message(up_to_message_id)
+    if src is None or last is None or last["conversation_id"] != conv_id:
+        return None
+    conn = _get_conn()
+    title = f"{src['title']} (fork)" if src["title"] else "Fork"
+    new = create_conversation(
+        title=title,
+        system_prompt=src["system_prompt"],
+        temperature=src["temperature"],
+        top_p=src["top_p"],
+        max_tokens=src["max_tokens"],
+    )
+    conn.execute(
+        """
+        INSERT INTO messages (conversation_id, role, content, created_at, meta)
+        SELECT ?, role, content, created_at, meta FROM messages
+        WHERE conversation_id = ? AND id <= ?
+        ORDER BY created_at ASC, id ASC
+        """,
+        (new["id"], conv_id, up_to_message_id),
+    )
+    conn.commit()
+    return new
+
+
+def _like_pattern(q: str) -> str:
+    esc = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{esc}%"
+
+
+def _snippet(text: str, q: str, radius: int = 50) -> str:
+    flat = " ".join(text.split())
+    i = flat.lower().find(q.lower())
+    if i < 0:
+        return flat[: radius * 2]
+    start = max(0, i - radius)
+    end = min(len(flat), i + len(q) + radius)
+    return ("…" if start else "") + flat[start:end] + ("…" if end < len(flat) else "")
+
+
+def search(q: str, limit: int = 40) -> list[dict]:
+    """Find conversations by title and messages by text (case-insensitive for ASCII)."""
+    q = q.strip()
+    if not q:
+        return []
+    conn = _get_conn()
+    pat = _like_pattern(q)
+    results: list[dict] = []
+    for r in conn.execute(
+        "SELECT id, title FROM conversations WHERE title LIKE ? ESCAPE '\\' ORDER BY id DESC LIMIT ?",
+        (pat, limit),
+    ):
+        results.append(
+            {"conversation_id": r["id"], "title": r["title"], "message_id": None, "role": None, "snippet": r["title"]}
+        )
+    rows = conn.execute(
+        """
+        SELECT m.id, m.conversation_id, m.role, m.content, c.title
+        FROM messages m JOIN conversations c ON c.id = m.conversation_id
+        WHERE m.content LIKE ? ESCAPE '\\'
+        ORDER BY m.id DESC LIMIT ?
+        """,
+        (pat, limit),
+    ).fetchall()
+    for r in rows:
+        results.append(
+            {
+                "conversation_id": r["conversation_id"],
+                "title": r["title"],
+                "message_id": r["id"],
+                "role": r["role"],
+                "snippet": _snippet(r["content"], q),
+            }
+        )
+    return results[:limit]
 
 
 def auto_title(conv_id: int, first_user_message: str) -> None:

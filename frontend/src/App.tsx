@@ -5,6 +5,7 @@ import {
   type Conversation,
   type ConversationPatch,
   type ConversationSettings,
+  exportUrl,
 } from "./lib/api";
 import Sidebar from "./components/Sidebar";
 import SettingsPanel from "./components/SettingsPanel";
@@ -31,6 +32,7 @@ export default function App() {
   const [model, setModel] = useState<string | null>(null);
   const [loadingModel, setLoadingModel] = useState<string | null>(null);
   const [modelsOpen, setModelsOpen] = useState(false);
+  const [ctxSize, setCtxSize] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -86,6 +88,7 @@ export default function App() {
       const h = await api.health();
       setModel(h.model);
       setLoadingModel(h.loading_model);
+      setCtxSize(h.ctx_size ?? null);
     } catch (e) {
       setError((e as Error).message);
     }
@@ -123,7 +126,10 @@ export default function App() {
   }
 
   /** Stream a reply into conversation `convId`, then re-sync with the database. */
-  async function runStream(convId: number, body: { content?: string; regenerate?: boolean }) {
+  async function runStream(
+    convId: number,
+    body: { content?: string; regenerate?: boolean; edit_message_id?: number },
+  ) {
     const controller = new AbortController();
     abortRef.current = controller;
     setBusy(true);
@@ -196,6 +202,34 @@ export default function App() {
     await runStream(convId, { regenerate: true });
   }
 
+  /** Replace a user message, drop everything after it, and re-answer. */
+  async function editMessage(index: number, content: string) {
+    const convId = activeIdRef.current;
+    const target = messages[index];
+    if (convId === null || busy || target?.id === undefined) return;
+    setError(null);
+    setMessages((m) => [
+      ...m.slice(0, index),
+      { ...m[index], content, meta: null },
+      { role: "assistant", content: "" },
+    ]);
+    await runStream(convId, { content, edit_message_id: target.id });
+  }
+
+  /** Copy the conversation up to a message into a new chat and open it. */
+  async function forkFrom(index: number) {
+    const convId = activeIdRef.current;
+    const target = messages[index];
+    if (convId === null || busy || target?.id === undefined) return;
+    try {
+      const conv = await api.forkConversation(convId, target.id);
+      await refreshList();
+      await openConversation(conv.id);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
   function stop() {
     abortRef.current?.abort();
   }
@@ -245,6 +279,12 @@ export default function App() {
     }, 500);
   }
 
+  // Context window usage, from the last reply's real prompt + completion tokens.
+  const lastMeta = [...messages].reverse().find((m) => m.role === "assistant" && m.meta)?.meta;
+  const ctxTotal = lastMeta?.ctx ?? ctxSize;
+  const ctxUsed = lastMeta ? lastMeta.prompt_tokens + lastMeta.tokens : null;
+  const ctxPct = ctxUsed !== null && ctxTotal ? Math.min(100, (ctxUsed / ctxTotal) * 100) : null;
+
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -281,6 +321,36 @@ export default function App() {
             </div>
           </div>
           <div className="flex items-center gap-3">
+            {ctxPct !== null && ctxTotal && ctxUsed !== null && (
+              <span
+                title="Context window used by this conversation (older messages are trimmed when it fills up)"
+                className={`hidden text-xs sm:inline ${
+                  ctxPct > 90 ? "text-red-400" : ctxPct > 75 ? "text-amber-400" : "text-zinc-500"
+                }`}
+              >
+                ctx {ctxUsed.toLocaleString()} / {ctxTotal.toLocaleString()}
+              </span>
+            )}
+            {activeId !== null && (
+              <details className="relative">
+                <summary className="cursor-pointer list-none rounded-md px-2 py-1 text-xs text-zinc-400 hover:bg-zinc-900 [&::-webkit-details-marker]:hidden">
+                  Export ▾
+                </summary>
+                <div className="absolute right-0 z-20 mt-1 grid w-40 rounded-xl border border-zinc-800 bg-zinc-950 p-1 shadow-xl">
+                  {(["md", "json"] as const).map((f) => (
+                    <a
+                      key={f}
+                      href={exportUrl(activeId, f)}
+                      download
+                      onClick={(e) => e.currentTarget.closest("details")?.removeAttribute("open")}
+                      className="rounded-lg px-3 py-1.5 text-xs text-zinc-300 hover:bg-zinc-900"
+                    >
+                      {f === "md" ? "Markdown (.md)" : "JSON (.json)"}
+                    </a>
+                  ))}
+                </div>
+              </details>
+            )}
             <button
               onClick={() => setModelsOpen(true)}
               title="Manage models"
@@ -316,6 +386,8 @@ export default function App() {
                 isLast={i === messages.length - 1}
                 streaming={busy}
                 onRegenerate={() => void regenerate()}
+                onEdit={m.role === "user" && m.id !== undefined && !busy ? (t) => void editMessage(i, t) : undefined}
+                onFork={m.id !== undefined && !busy ? () => void forkFrom(i) : undefined}
               />
             ))}
             {error && (

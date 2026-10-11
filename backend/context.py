@@ -12,10 +12,20 @@ and logits.
 
 from __future__ import annotations
 
+import os
+
 # Budget in tokens of *history* we are willing to send llama-server.  The rest
 # of the 4096-token window is headroom for the reply and the KV cache.
 CONTEXT_BUDGET_TOKENS = 2800
 CHARS_PER_TOKEN = 3
+
+
+def ctx_size() -> int:
+    """Context window llama-server is started with (same env var as llama_server)."""
+    try:
+        return int(os.environ.get("LLAMA_CTX_SIZE", "4096"))
+    except ValueError:
+        return 4096
 
 
 def estimate_tokens(messages: list[dict]) -> int:

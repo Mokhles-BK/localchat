@@ -248,8 +248,12 @@ class LlamaServer:
             "temperature": kwargs.get("temperature", 0.7),
             "top_p": kwargs.get("top_p", 0.9),
             "max_tokens": kwargs.get("max_tokens", -1),
+            # Ask for a final usage chunk (prompt/completion token counts).
+            "stream_options": {"include_usage": True},
         }
         sink: list[str] = kwargs.pop("sink", [])
+        # Optional dict filled with llama-server's ``usage`` / ``timings`` data.
+        stats: dict | None = kwargs.pop("stats", None)
         async with httpx.AsyncClient(timeout=None) as client:
             async with client.stream(
                 "POST",
@@ -266,8 +270,14 @@ class LlamaServer:
                             break
                         try:
                             chunk = json.loads(data)
-                            text = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                        except (json.JSONDecodeError, IndexError, KeyError):
+                            choices = chunk.get("choices") or [{}]
+                            text = choices[0].get("delta", {}).get("content", "") or ""
+                            if stats is not None:
+                                if isinstance(chunk.get("usage"), dict):
+                                    stats["usage"] = chunk["usage"]
+                                if isinstance(chunk.get("timings"), dict):
+                                    stats["timings"] = chunk["timings"]
+                        except (json.JSONDecodeError, IndexError, KeyError, AttributeError, TypeError):
                             text = ""
                         if text:
                             sink.append(text)

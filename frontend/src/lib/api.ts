@@ -1,8 +1,27 @@
 /** Thin typed client for the LocalChat backend. */
 
+/** Token counts and speed saved with each assistant reply. */
+export interface MessageMeta {
+  tokens: number;
+  prompt_tokens: number;
+  ctx: number;
+  exact: boolean;
+  tps?: number;
+}
+
 export interface ChatMessage {
+  id?: number; // missing only while a message is still being created
   role: "system" | "user" | "assistant";
   content: string;
+  meta?: MessageMeta | null;
+}
+
+export interface SearchHit {
+  conversation_id: number;
+  title: string;
+  message_id: number | null; // null = the title matched
+  role: "user" | "assistant" | null;
+  snippet: string;
 }
 
 export interface Conversation {
@@ -81,6 +100,7 @@ export interface HealthResponse {
   llama_server_detail: string;
   model: string | null;
   loading_model: string | null;
+  ctx_size: number;
   models_dir: string;
   exists: boolean;
   models: ModelInfo[];
@@ -90,6 +110,7 @@ export interface StreamRequest {
   conversation_id: number;
   content?: string;
   regenerate?: boolean;
+  edit_message_id?: number;
 }
 
 const BASE = "/api";
@@ -186,6 +207,10 @@ export const api = {
   messages: async (id: number) =>
     (await request<{ messages: ChatMessage[] }>("GET", `/conversations/${id}/messages`)).messages,
   streamChat,
+  search: async (q: string) =>
+    (await request<{ results: SearchHit[] }>("GET", `/search?q=${encodeURIComponent(q)}`)).results,
+  forkConversation: (id: number, upToMessageId: number) =>
+    request<Conversation>("POST", `/conversations/${id}/fork`, { up_to_message_id: upToMessageId }),
   listModels: async () => (await request<{ models: ModelInfo[] }>("GET", "/models")).models,
   searchRepos: async (q: string) =>
     (await request<{ results: RepoResult[] }>("GET", `/models/search?q=${encodeURIComponent(q)}`)).results,
@@ -209,3 +234,7 @@ export const api = {
     request<{ model: string }>("POST", "/models/activate", { name }),
   deleteModel: (name: string) => request<void>("DELETE", `/models/${encodeURIComponent(name)}`),
 };
+
+/** Download link for a conversation export (the browser handles the file). */
+export const exportUrl = (id: number, format: "md" | "json") =>
+  `${BASE}/conversations/${id}/export?format=${format}`;
