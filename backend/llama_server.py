@@ -13,6 +13,7 @@ llama-cpp-python (Windows CUDA build issues).
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
@@ -226,6 +227,51 @@ class LlamaServer:
                     if data == "[DONE]":
                         break
                     yield data
+
+    async def chat_stream_async(self, messages, **kwargs):
+        """Async generator of raw SSE payloads, *cancellable*.
+
+        The upstream httpx stream is wrapped in an ``async with`` so that when
+        the downstream client disconnects (Stop), the async generator is
+        closed via GeneratorExit and the context manager's ``__aexit__``
+        closes the response.  llama-server — seeing the connection drop —
+        cancels the in-flight generation on the GPU.  No process restart, no
+        POST /api/chat/stop endpoint.
+
+        If ``sink`` is given (a list), the decoded assistant text is appended
+        to it as it streams, so the caller can persist a partial reply if the
+        stream is cancelled mid-generation.
+        """
+        payload = {
+            "messages": messages,
+            "stream": True,
+            "temperature": kwargs.get("temperature", 0.7),
+            "top_p": kwargs.get("top_p", 0.9),
+            "max_tokens": kwargs.get("max_tokens", -1),
+        }
+        sink: list[str] = kwargs.pop("sink", [])
+        async with httpx.AsyncClient(timeout=None) as client:
+            async with client.stream(
+                "POST",
+                f"{self.base_url}/v1/chat/completions",
+                json=payload,
+            ) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    if line.startswith("data: "):
+                        data = line[len("data: ") :]
+                        if data == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data)
+                            text = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                        except (json.JSONDecodeError, IndexError, KeyError):
+                            text = ""
+                        if text:
+                            sink.append(text)
+                        yield data
 
 
 def register_exit_handler(server: LlamaServer) -> None:

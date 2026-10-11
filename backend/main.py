@@ -20,9 +20,12 @@ from typing import Any, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
 
 from llama_server import LlamaServer, register_exit_handler
+from routes_conversations import router
+from schemas import ChatRequest
+import storage
+from chat_service import build_context, effective_settings
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 MODELS_DIR = DATA_DIR / "models"
@@ -35,13 +38,6 @@ _server: Optional[LlamaServer] = None
 # --------------------------------------------------------------------------- #
 # Schemas
 # --------------------------------------------------------------------------- #
-class ChatRequest(BaseModel):
-    messages: list[dict[str, str]] = Field(..., description="OpenAI-style messages")
-    temperature: float = Field(0.7, ge=0.0, le=2.0)
-    top_p: float = Field(0.9, ge=0.0, le=1.0)
-    max_tokens: int = Field(-1, ge=-1)
-
-
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
@@ -95,6 +91,7 @@ async def lifespan(app: FastAPI):
     yield
     if _server is not None:
         _server.close()
+    storage.close()
 
 
 app = FastAPI(title="LocalChat", version="0.1.0", lifespan=lifespan)
@@ -104,6 +101,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(router)
 
 
 # --------------------------------------------------------------------------- #
@@ -137,31 +135,67 @@ def list_models() -> dict[str, Any]:
 
 
 @app.post("/api/chat")
-def chat(req: ChatRequest) -> StreamingResponse:
+async def chat(req: ChatRequest) -> StreamingResponse:
     """Stream the model's reply token-by-token as Server-Sent Events.
 
-    The generator is *sync*: StreamingResponse runs it in a threadpool, so the
-    event loop stays free and /api/health remains responsive mid-generation.
+    The database is the source of truth for history: the client sends only
+    the new user message (or ``regenerate: true``), and the server builds the
+    model context from the stored system prompt and stored messages.
+
+    The route is *async* so Starlette cancels the response task when the
+    client disconnects (Stop).  Cancellation, errors and normal completion all
+    end in the ``finally`` block below, which is the ONE place the assistant
+    reply (full or partial) is saved.
     """
-    if _server is None or not _server.is_running:
+    server = _server
+    if server is None or not server.is_running:
         raise HTTPException(
             status_code=503,
             detail="llama-server is not running — check /api/health for the log file",
         )
 
-    def event_generator():
+    conv = storage.get_conversation(req.conversation_id)
+    if conv is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+
+    settings = effective_settings(conv, req)
+
+    if req.regenerate:
+        # Re-answer from the stored history; needs an assistant reply to drop.
+        if not any(m["role"] == "assistant" for m in storage.list_messages(req.conversation_id)):
+            raise HTTPException(status_code=400, detail="nothing to regenerate")
+        storage.delete_last_assistant_message(req.conversation_id)
+    else:
+        if not req.content.strip():
+            raise HTTPException(status_code=400, detail="content is required")
+        # Save the user message BEFORE streaming so it survives a cancel.
+        storage.add_message(req.conversation_id, "user", req.content)
+        if not conv["title"]:
+            storage.auto_title(req.conversation_id, req.content)
+
+    history = storage.list_messages(req.conversation_id)
+    messages = build_context(conv, history, None)
+
+    async def event_generator():
+        sink: list[str] = []
         try:
-            for data in _server.chat_stream(  # type: ignore[union-attr]
-                req.messages,
-                temperature=req.temperature,
-                top_p=req.top_p,
-                max_tokens=req.max_tokens,
+            async for data in server.chat_stream_async(
+                messages,
+                temperature=settings["temperature"],
+                top_p=settings["top_p"],
+                max_tokens=settings["max_tokens"],
+                sink=sink,
             ):
                 yield f"data: {data}\n\n"
             yield "data: [DONE]\n\n"
         except Exception as exc:  # noqa: BLE001
             yield f"data: {json.dumps({'error': str(exc)})}\n\n"
             yield "data: [DONE]\n\n"
+        finally:
+            # Runs on completion, error AND client-disconnect cancellation.
+            text = "".join(sink)
+            if text.strip():
+                storage.add_message(req.conversation_id, "assistant", text)
 
     return StreamingResponse(
         event_generator(),
