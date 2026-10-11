@@ -9,6 +9,7 @@ import {
 import Sidebar from "./components/Sidebar";
 import SettingsPanel from "./components/SettingsPanel";
 import Message from "./components/Message";
+import ModelsPanel from "./components/ModelsPanel";
 
 const ACTIVE_KEY = "localchat.activeId";
 const DEFAULT_SETTINGS: ConversationSettings = {
@@ -28,6 +29,8 @@ export default function App() {
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [model, setModel] = useState<string | null>(null);
+  const [loadingModel, setLoadingModel] = useState<string | null>(null);
+  const [modelsOpen, setModelsOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -66,10 +69,7 @@ export default function App() {
 
   // Initial load: health, conversation list, last open conversation.
   useEffect(() => {
-    api
-      .health()
-      .then((h) => setModel(h.model))
-      .catch((e) => setError((e as Error).message));
+    void refreshHealth();
     api
       .listConversations()
       .then(async (list) => {
@@ -80,6 +80,23 @@ export default function App() {
       .catch((e) => setError((e as Error).message));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  async function refreshHealth() {
+    try {
+      const h = await api.health();
+      setModel(h.model);
+      setLoadingModel(h.loading_model);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
+  // While a model is loading (even after a page reload), keep checking.
+  useEffect(() => {
+    if (!loadingModel) return;
+    const id = window.setInterval(() => void refreshHealth(), 2000);
+    return () => window.clearInterval(id);
+  }, [loadingModel]);
 
   async function refreshList() {
     try {
@@ -151,7 +168,7 @@ export default function App() {
 
   async function send() {
     const text = input.trim();
-    if (!text || busy) return;
+    if (!text || busy || loadingModel) return;
     setError(null);
 
     let convId = activeIdRef.current;
@@ -264,7 +281,13 @@ export default function App() {
             </div>
           </div>
           <div className="flex items-center gap-3">
-            <span className="text-xs text-zinc-500">{model ?? "loading model…"}</span>
+            <button
+              onClick={() => setModelsOpen(true)}
+              title="Manage models"
+              className="max-w-[16rem] truncate rounded-md px-2 py-1 text-xs text-zinc-400 hover:bg-zinc-900 hover:text-zinc-100"
+            >
+              {loadingModel ? `loading ${loadingModel}…` : (model ?? "no model")} ▾
+            </button>
             <button
               onClick={() => setSettingsOpen((v) => !v)}
               className={`rounded-md px-2 py-1 text-xs ${
@@ -324,7 +347,7 @@ export default function App() {
             ) : (
               <button
                 onClick={() => void send()}
-                disabled={!input.trim()}
+                disabled={!input.trim() || !!loadingModel}
                 className="rounded-2xl bg-emerald-600 px-4 py-3 text-sm font-semibold text-white hover:bg-emerald-500 disabled:opacity-40"
               >
                 Send
@@ -333,6 +356,13 @@ export default function App() {
           </div>
         </div>
       </div>
+      {modelsOpen && (
+        <ModelsPanel
+          activeModel={model}
+          onClose={() => setModelsOpen(false)}
+          onModelChanged={() => void refreshHealth()}
+        />
+      )}
     </div>
   );
 }

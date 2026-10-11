@@ -24,9 +24,45 @@ export type ConversationSettings = Pick<
 >;
 export type ConversationPatch = Partial<ConversationSettings & Pick<Conversation, "title">>;
 
+export type Fit = "gpu" | "partial" | "too_big" | "unknown";
+
 export interface ModelInfo {
   name: string;
   size_bytes: number;
+  quant?: string | null;
+  fit?: Fit;
+}
+
+export interface RepoResult {
+  repo_id: string;
+  downloads: number;
+  likes: number;
+}
+
+export interface RepoFile {
+  filename: string;
+  size_bytes: number;
+  quant: string | null;
+  fit: Fit;
+  installed: boolean;
+  downloadable: boolean;
+  note: string | null;
+}
+
+export interface DownloadJob {
+  id: string;
+  repo_id: string;
+  filename: string;
+  total: number;
+  downloaded: number;
+  status: "queued" | "downloading" | "done" | "error" | "cancelled";
+  error: string | null;
+}
+
+export function formatBytes(n: number): string {
+  if (n >= 1024 ** 3) return `${(n / 1024 ** 3).toFixed(2)} GB`;
+  if (n >= 1024 ** 2) return `${(n / 1024 ** 2).toFixed(0)} MB`;
+  return `${Math.max(1, Math.round(n / 1024))} KB`;
 }
 
 export interface HealthResponse {
@@ -34,6 +70,7 @@ export interface HealthResponse {
   llama_server: boolean;
   llama_server_detail: string;
   model: string | null;
+  loading_model: string | null;
   models_dir: string;
   exists: boolean;
   models: ModelInfo[];
@@ -139,4 +176,17 @@ export const api = {
   messages: async (id: number) =>
     (await request<{ messages: ChatMessage[] }>("GET", `/conversations/${id}/messages`)).messages,
   streamChat,
+  listModels: async () => (await request<{ models: ModelInfo[] }>("GET", "/models")).models,
+  searchRepos: async (q: string) =>
+    (await request<{ results: RepoResult[] }>("GET", `/models/search?q=${encodeURIComponent(q)}`)).results,
+  repoFiles: async (repoId: string) =>
+    (await request<{ files: RepoFile[] }>("GET", `/models/files?repo_id=${encodeURIComponent(repoId)}`)).files,
+  startDownload: (repo_id: string, filename: string) =>
+    request<DownloadJob>("POST", "/models/download", { repo_id, filename }),
+  downloads: async () =>
+    (await request<{ downloads: DownloadJob[] }>("GET", "/models/downloads")).downloads,
+  cancelDownload: (id: string) => request<void>("DELETE", `/models/downloads/${id}`),
+  activateModel: (name: string) =>
+    request<{ model: string }>("POST", "/models/activate", { name }),
+  deleteModel: (name: string) => request<void>("DELETE", `/models/${encodeURIComponent(name)}`),
 };

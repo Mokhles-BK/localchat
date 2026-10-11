@@ -11,8 +11,11 @@ first chat message never blocks on a 120 s cold start.
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
+import signal
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
@@ -21,8 +24,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-from llama_server import LlamaServer, register_exit_handler
+import model_manager
+from llama_server import LlamaServer
 from routes_conversations import router
+from routes_models import router as models_router
 from schemas import ChatRequest
 import storage
 from chat_service import build_context, effective_settings
@@ -33,6 +38,8 @@ BIN_DIR = DATA_DIR / "bin"
 
 # Single shared llama-server instance for the whole process.
 _server: Optional[LlamaServer] = None
+# Name of the model currently being loaded by /api/models/activate, if any.
+_loading_model: Optional[str] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -46,27 +53,43 @@ def _default_binary() -> Path:
 
 
 def _default_model() -> Path:
-    """Pick the first GGUF in data/models, preferring Q4_K_M."""
-    if not MODELS_DIR.exists():
-        raise RuntimeError(f"models dir missing: {MODELS_DIR}")
-    candidates = sorted(MODELS_DIR.glob("*.gguf"))
-    if not candidates:
-        raise RuntimeError(f"no .gguf models in {MODELS_DIR}")
-    for pref in ("Q4_K_M", "Q4_K_S", "Q4_0"):
-        for c in candidates:
-            if pref in c.name:
-                return c
-    return candidates[0]
+    """The saved model choice, else the best GGUF in data/models."""
+    return model_manager.default_model()
 
 
 def _model_status() -> dict[str, Any]:
-    if not MODELS_DIR.exists():
-        return {"models_dir": str(MODELS_DIR), "exists": False, "models": []}
-    models = [
-        {"name": p.name, "size_bytes": p.stat().st_size}
-        for p in sorted(MODELS_DIR.glob("*.gguf"))
-    ]
-    return {"models_dir": str(MODELS_DIR), "exists": True, "models": models}
+    return {
+        "models_dir": str(MODELS_DIR),
+        "exists": MODELS_DIR.exists(),
+        "models": model_manager.list_local(),
+    }
+
+
+def _close_current() -> None:
+    """Stop whichever llama-server is current (it changes when models switch)."""
+    server = _server
+    if server is not None:
+        server.close()
+
+
+def _install_exit_handlers() -> None:
+    """Make sure llama-server dies with us, whatever model is loaded.
+
+    One handler for the whole process that looks up `_server` at exit time.
+    (The old per-server handler would only stop the FIRST model's server.)
+    """
+    atexit.register(_close_current)
+
+    def _handler(signum, frame):  # noqa: ARG001
+        _close_current()
+        sys.exit(0)
+
+    try:
+        signal.signal(signal.SIGINT, _handler)
+        if hasattr(signal, "SIGTERM"):
+            signal.signal(signal.SIGTERM, _handler)
+    except ValueError:
+        pass  # not in the main thread (e.g. under a test runner)
 
 
 # --------------------------------------------------------------------------- #
@@ -76,25 +99,26 @@ def _model_status() -> dict[str, Any]:
 async def lifespan(app: FastAPI):
     global _server
     try:
+        model = _default_model()
         _server = LlamaServer(
             binary=_default_binary(),
-            model=_default_model(),
+            model=model,
             host="127.0.0.1",
             port=8080,
-            n_gpu_layers=int(os.environ.get("LLAMA_N_GPU_LAYERS", "999")),
+            n_gpu_layers=model_manager.gpu_layers_for(model.name),
         )
+        _install_exit_handlers()
         _server.start()
-        register_exit_handler(_server)
     except Exception as exc:  # noqa: BLE001 - keep the app up, /api/health reports it
+        _close_current()
         _server = None
         print(f"[startup] llama-server failed to start: {exc!r}", flush=True)
     yield
-    if _server is not None:
-        _server.close()
+    _close_current()
     storage.close()
 
 
-app = FastAPI(title="LocalChat", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="LocalChat", version="0.3.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -102,6 +126,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(router)
+app.include_router(models_router)
 
 
 # --------------------------------------------------------------------------- #
@@ -124,6 +149,7 @@ def health() -> dict[str, Any]:
         "llama_server": server_ok,
         "llama_server_detail": server_detail,
         "model": _server.model.name if _server else None,
+        "loading_model": _loading_model,
         "log_file": str(_server.log_path) if _server else None,
         **_model_status(),
     }
@@ -148,6 +174,10 @@ async def chat(req: ChatRequest) -> StreamingResponse:
     reply (full or partial) is saved.
     """
     server = _server
+    if _loading_model is not None:
+        raise HTTPException(
+            status_code=503, detail=f"model {_loading_model} is loading, try again in a moment"
+        )
     if server is None or not server.is_running:
         raise HTTPException(
             status_code=503,
