@@ -4,6 +4,7 @@ import {
   formatBytes,
   type DownloadJob,
   type Fit,
+  type LocalCandidate,
   type ModelInfo,
   type RepoFile,
   type RepoResult,
@@ -41,6 +42,9 @@ export default function ModelsPanel({ activeModel, onClose, onModelChanged }: Pr
   const [loadingFiles, setLoadingFiles] = useState(false);
   const [switching, setSwitching] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [candidates, setCandidates] = useState<LocalCandidate[] | null>(null);
+  const [scanning, setScanning] = useState(false);
+  const [folder, setFolder] = useState("");
   const prevStatus = useRef<Record<string, string>>({});
 
   const fail = (e: unknown) => setError((e as Error).message);
@@ -116,6 +120,28 @@ export default function ModelsPanel({ activeModel, onClose, onModelChanged }: Pr
     }
   }
 
+  async function scan(useFolder: boolean) {
+    setScanning(true);
+    setError(null);
+    try {
+      setCandidates(await api.scan(useFolder ? folder.trim() : undefined));
+    } catch (e) {
+      fail(e);
+    } finally {
+      setScanning(false);
+    }
+  }
+
+  async function importModel(c: LocalCandidate) {
+    setError(null);
+    try {
+      await api.importModel(c.path, c.name);
+      setJobs(await api.downloads());
+    } catch (e) {
+      fail(e);
+    }
+  }
+
   async function download(f: RepoFile) {
     if (!repo) return;
     setError(null);
@@ -159,6 +185,9 @@ export default function ModelsPanel({ activeModel, onClose, onModelChanged }: Pr
       fail(e);
     }
   }
+
+  const installedNames = new Set(local.map((m) => m.name));
+  const sourceLabel = { ollama: "Ollama", lmstudio: "LM Studio", folder: "Folder" } as const;
 
   const visibleJobs = jobs.filter((j) => isActive(j) || (j.status === "error" && !dismissed.has(j.id)));
 
@@ -269,6 +298,73 @@ export default function ModelsPanel({ activeModel, onClose, onModelChanged }: Pr
               </div>
             </section>
           )}
+
+          {/* Already on this PC */}
+          <section>
+            <h3 className="mb-2 text-xs font-medium uppercase tracking-wide text-zinc-500">Found on this PC</h3>
+            <p className="mb-2 text-xs text-zinc-600">
+              Import models you already have (Ollama, LM Studio, or any folder). On the same drive this is instant and
+              uses no extra disk space.
+            </p>
+            <div className="flex gap-2">
+              <button
+                onClick={() => void scan(false)}
+                disabled={scanning}
+                className="shrink-0 rounded-xl bg-zinc-800 px-4 py-2 text-sm text-zinc-100 hover:bg-zinc-700 disabled:opacity-40"
+              >
+                {scanning ? "Scanning…" : "Scan Ollama / LM Studio"}
+              </button>
+              <input
+                value={folder}
+                onChange={(e) => setFolder(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && folder.trim() && void scan(true)}
+                placeholder="or a folder, e.g. C:\Users\you\Downloads"
+                className="min-w-0 flex-1 rounded-xl border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-emerald-600"
+              />
+              <button
+                onClick={() => void scan(true)}
+                disabled={scanning || !folder.trim()}
+                className="shrink-0 rounded-xl bg-zinc-800 px-3 py-2 text-sm text-zinc-100 hover:bg-zinc-700 disabled:opacity-40"
+              >
+                Scan folder
+              </button>
+            </div>
+            {candidates && candidates.length === 0 && (
+              <p className="mt-3 text-sm text-zinc-600">No GGUF models found there.</p>
+            )}
+            {candidates && candidates.length > 0 && (
+              <div className="mt-3 grid gap-1">
+                {candidates.map((c) => {
+                  const have = c.installed || installedNames.has(c.name);
+                  const importing = jobs.some((j) => j.filename === c.name && isActive(j));
+                  return (
+                    <div key={c.path} className="flex items-center gap-3 rounded-lg px-3 py-2 hover:bg-zinc-900">
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate text-sm text-zinc-200">{c.name}</div>
+                        <div className="mt-0.5 flex flex-wrap items-center gap-2 text-xs text-zinc-500">
+                          <span>{sourceLabel[c.source]}</span>
+                          <span>{formatBytes(c.size_bytes)}</span>
+                          {c.quant && <span>{c.quant}</span>}
+                          <FitBadge fit={c.fit} />
+                        </div>
+                      </div>
+                      {have ? (
+                        <span className="text-xs text-zinc-500">Imported</span>
+                      ) : (
+                        <button
+                          onClick={() => void importModel(c)}
+                          disabled={importing}
+                          className="rounded-lg bg-zinc-800 px-3 py-1 text-xs text-zinc-100 hover:bg-zinc-700 disabled:opacity-40"
+                        >
+                          {importing ? "Importing…" : "Import"}
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </section>
 
           {/* Hugging Face */}
           <section>

@@ -49,6 +49,16 @@ export interface RepoFile {
   note: string | null;
 }
 
+export interface LocalCandidate {
+  path: string;
+  name: string;
+  size_bytes: number;
+  source: "ollama" | "lmstudio" | "folder";
+  quant: string | null;
+  fit: Fit;
+  installed: boolean;
+}
+
 export interface DownloadJob {
   id: string;
   repo_id: string;
@@ -181,6 +191,15 @@ export const api = {
     (await request<{ results: RepoResult[] }>("GET", `/models/search?q=${encodeURIComponent(q)}`)).results,
   repoFiles: async (repoId: string) =>
     (await request<{ files: RepoFile[] }>("GET", `/models/files?repo_id=${encodeURIComponent(repoId)}`)).files,
+  scan: async (folder?: string) =>
+    (
+      await request<{ candidates: LocalCandidate[] }>(
+        "GET",
+        `/models/scan${folder ? `?folder=${encodeURIComponent(folder)}` : ""}`,
+      )
+    ).candidates,
+  importModel: (path: string, name?: string) =>
+    request<DownloadJob>("POST", "/models/import", { path, name }),
   startDownload: (repo_id: string, filename: string) =>
     request<DownloadJob>("POST", "/models/download", { repo_id, filename }),
   downloads: async () =>

@@ -6,6 +6,8 @@ it is easy to test (tests swap `_client` for an httpx MockTransport client).
 
 from __future__ import annotations
 
+import itertools
+import json
 import os
 import re
 import shutil
@@ -216,6 +218,106 @@ def list_repo_files(repo_id: str) -> list[dict[str, Any]]:
 
 
 # --------------------------------------------------------------------------- #
+# Models already on this PC (Ollama, LM Studio, any folder)
+# --------------------------------------------------------------------------- #
+MAX_SCAN_FILES = 500
+DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def is_gguf(path: Path) -> bool:
+    """True if the file starts with the GGUF magic bytes."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(4) == b"GGUF"
+    except OSError:
+        return False
+
+
+def ollama_dir() -> Path:
+    env = os.environ.get("OLLAMA_MODELS")
+    return Path(env) if env else Path.home() / ".ollama" / "models"
+
+
+def lmstudio_dirs() -> list[Path]:
+    home = Path.home()
+    return [home / ".lmstudio" / "models", home / ".cache" / "lm-studio" / "models"]
+
+
+def _dest_name(display: str) -> str:
+    name = re.sub(r"[^\w.\-+]+", "_", display).strip("._") or "model"
+    return name if name.lower().endswith(".gguf") else name + ".gguf"
+
+
+def _candidate(path: Path, name: str, source: str) -> dict[str, Any]:
+    size = path.stat().st_size
+    return {
+        "path": str(path),
+        "name": name,
+        "size_bytes": size,
+        "source": source,
+        "quant": quant_of(name),
+        "fit": fit_estimate(size),
+    }
+
+
+def _scan_ollama() -> list[dict[str, Any]]:
+    root = ollama_dir()
+    manifests, blobs = root / "manifests", root / "blobs"
+    if not manifests.is_dir():
+        return []
+    out = []
+    for mf in itertools.islice((p for p in manifests.rglob("*") if p.is_file()), MAX_SCAN_FILES):
+        try:
+            data = json.loads(mf.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        for layer in data.get("layers", []) if isinstance(data, dict) else []:
+            digest = str(layer.get("digest", ""))
+            if not str(layer.get("mediaType", "")).endswith("image.model") or not DIGEST_RE.match(digest):
+                continue
+            blob = blobs / digest.replace(":", "-")
+            if not (blob.is_file() and is_gguf(blob)):
+                continue
+            parts = list(mf.relative_to(manifests).parts)[1:]  # drop registry host
+            if parts and parts[0] == "library":
+                parts = parts[1:]
+            out.append(_candidate(blob, _dest_name("-".join(parts)), "ollama"))
+    return out
+
+
+def _scan_dir(folder: Path, source: str) -> list[dict[str, Any]]:
+    if not folder.is_dir():
+        return []
+    ours = MODELS_DIR.resolve()
+    out = []
+    files = (p for p in folder.rglob("*.gguf") if p.is_file())
+    for p in itertools.islice(files, MAX_SCAN_FILES):
+        low = p.name.lower()
+        if "mmproj" in low or SPLIT_RE.search(low) or ours in p.resolve().parents:
+            continue
+        if is_gguf(p):
+            out.append(_candidate(p, p.name, source))
+    return out
+
+
+def scan_local(folder: Optional[str] = None) -> list[dict[str, Any]]:
+    """Find GGUF models outside data/models: Ollama + LM Studio, or one folder."""
+    if folder:
+        path = Path(folder).expanduser()
+        if not path.is_dir():
+            raise ValueError("folder not found")
+        found = _scan_dir(path, "folder")
+    else:
+        found = _scan_ollama()
+        for d in lmstudio_dirs():
+            found += _scan_dir(d, "lmstudio")
+    have = {m["name"] for m in list_local()}
+    for c in found:
+        c["installed"] = c["name"] in have
+    return sorted(found, key=lambda c: (c["source"], c["name"].lower()))
+
+
+# --------------------------------------------------------------------------- #
 # Downloads (background threads, resumable)
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -317,5 +419,69 @@ def _run_download(job: DownloadJob) -> None:
         os.replace(part, dest)
         job.status = "done"
     except Exception as exc:  # noqa: BLE001 - reported to the UI
+        job.status = "error"
+        job.error = str(exc) or exc.__class__.__name__
+
+
+# --------------------------------------------------------------------------- #
+# Import a model from elsewhere on this PC
+# --------------------------------------------------------------------------- #
+def start_import(path: str, name: Optional[str] = None, *, threaded: bool = True) -> DownloadJob:
+    """Bring a local GGUF into data/models: hard link if possible, else copy."""
+    source = Path(path).expanduser()
+    if not source.is_file() or not is_gguf(source):
+        raise ValueError("not a GGUF file")
+    filename = _dest_name(name) if name else source.name
+    if not FILE_RE.match(filename) or Path(filename).name != filename:
+        raise ValueError("invalid file name")
+    if SPLIT_RE.search(filename) or "mmproj" in filename.lower():
+        raise ValueError("this file cannot be used as a chat model")
+    with _jobs_lock:
+        for job in _jobs.values():
+            if job.filename == filename and job.status in ACTIVE:
+                return job
+        if (MODELS_DIR / filename).exists():
+            raise FileExistsError(filename)
+        job = DownloadJob(id=uuid.uuid4().hex[:12], repo_id="local", filename=filename)
+        _jobs[job.id] = job
+    if threaded:
+        threading.Thread(target=_run_import, args=(job, source), daemon=True).start()
+    return job
+
+
+def _run_import(job: DownloadJob, source: Path) -> None:
+    dest = MODELS_DIR / job.filename
+    part = dest.with_name(dest.name + ".part")
+    try:
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        job.status = "downloading"
+        job.total = source.stat().st_size
+        try:
+            os.link(source, dest)  # instant, no extra disk space (same drive only)
+            job.downloaded = job.total
+            job.status = "done"
+            return
+        except FileExistsError:
+            raise
+        except OSError:
+            pass  # other drive or no hard-link support: copy instead
+        if shutil.disk_usage(MODELS_DIR).free < job.total + MIN_FREE_BYTES:
+            raise OSError("not enough free disk space")
+        with open(source, "rb") as src, open(part, "wb") as out:
+            while True:
+                chunk = src.read(1 << 20)
+                if not chunk:
+                    break
+                if job.cancel.is_set():
+                    out.close()
+                    part.unlink(missing_ok=True)
+                    job.status = "cancelled"
+                    return
+                out.write(chunk)
+                job.downloaded += len(chunk)
+        os.replace(part, dest)
+        job.status = "done"
+    except Exception as exc:  # noqa: BLE001 - reported to the UI
+        part.unlink(missing_ok=True)
         job.status = "error"
         job.error = str(exc) or exc.__class__.__name__

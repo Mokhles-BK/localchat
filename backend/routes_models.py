@@ -23,6 +23,11 @@ class DownloadBody(BaseModel):
     filename: str
 
 
+class ImportBody(BaseModel):
+    path: str
+    name: Optional[str] = None
+
+
 class ActivateBody(BaseModel):
     name: str
     n_gpu_layers: Optional[int] = Field(None, ge=0, le=999)
@@ -50,6 +55,26 @@ def files(repo_id: str):
         return {"repo_id": repo_id, "files": model_manager.list_repo_files(repo_id)}
     except (httpx.HTTPError, ValueError) as exc:
         raise _hf_error(exc) from exc
+
+
+@router.get("/scan")
+def scan(folder: Optional[str] = None):
+    """Models already on this PC (Ollama + LM Studio, or one folder)."""
+    try:
+        return {"candidates": model_manager.scan_local(folder)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/import", status_code=201)
+def import_model(body: ImportBody):
+    try:
+        job = model_manager.start_import(body.path, body.name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail="a model with that name already exists") from exc
+    return job.public()
 
 
 @router.post("/download", status_code=201)
