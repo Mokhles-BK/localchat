@@ -76,11 +76,11 @@ def test_scan_ollama_names_and_filters(env):
 
 def test_scan_lmstudio_and_folder(env):
     gguf(env.lm / "pub" / "repo" / "m-Q4_K_M.gguf")
-    gguf(env.lm / "pub" / "repo" / "mmproj-F16.gguf")  # skipped
+    gguf(env.lm / "pub" / "repo" / "mmproj-F16.gguf")  # listed, as a projector
     gguf(env.lm / "pub" / "repo" / "big-00001-of-00002.gguf")  # skipped
     (env.lm / "pub" / "repo" / "fake.gguf").write_bytes(b"text")  # not GGUF
     found = mm.scan_local()
-    assert [c["name"] for c in found] == ["m-Q4_K_M.gguf"]
+    assert [(c["name"], c["kind"]) for c in found] == [("m-Q4_K_M.gguf", "model"), ("mmproj-F16.gguf", "projector")]
     assert found[0]["quant"] == "Q4_K_M" and found[0]["source"] == "lmstudio"
 
     other = env.tmp / "Downloads"

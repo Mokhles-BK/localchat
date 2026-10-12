@@ -24,6 +24,7 @@ class FakeLlama:
     def __init__(self, binary, model, host="127.0.0.1", port=8080, n_gpu_layers=999, extra_args=None):
         self.model = Path(model)
         self.n_gpu_layers = n_gpu_layers
+        self.extra_args = list(extra_args or [])
         self.started = False
         self.closed = False
         FakeLlama.instances.append(self)

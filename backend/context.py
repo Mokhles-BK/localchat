@@ -18,6 +18,8 @@ import os
 # of the 4096-token window is headroom for the reply and the KV cache.
 CONTEXT_BUDGET_TOKENS = 2800
 CHARS_PER_TOKEN = 3
+# Rough cost of one image in the context window (varies by vision model).
+IMAGE_TOKENS = 320
 
 
 def ctx_size() -> int:
@@ -28,14 +30,27 @@ def ctx_size() -> int:
         return 4096
 
 
+def _content_chars(content) -> int:
+    """Character-equivalent size of a message body (text, or text + image parts)."""
+    if isinstance(content, str):
+        return len(content)
+    total = 0
+    for part in content or []:
+        if part.get("type") == "image_url":
+            total += IMAGE_TOKENS * CHARS_PER_TOKEN
+        else:
+            total += len(part.get("text", ""))
+    return total
+
+
 def estimate_tokens(messages: list[dict]) -> int:
     """Rough token count for a list of OpenAI-style messages."""
-    chars = sum(len(m.get("content", "")) for m in messages)
+    chars = sum(_content_chars(m.get("content", "")) for m in messages)
     overhead = 4 * len(messages)
     return (chars + overhead) // CHARS_PER_TOKEN
 
 
-def trim_messages(messages: list[dict], budget: int = CONTEXT_BUDGET_TOKENS) -> list[dict]:
+def trim_messages(messages: list[dict], budget: int | None = None) -> list[dict]:
     """Trim oldest messages until the estimate fits the budget.
 
     Rules:
@@ -51,6 +66,9 @@ def trim_messages(messages: list[dict], budget: int = CONTEXT_BUDGET_TOKENS) -> 
     """
     if not messages:
         return messages
+    if budget is None:
+        # History may use ~68% of the window (2800 of 4096); follows LLAMA_CTX_SIZE.
+        budget = max(CONTEXT_BUDGET_TOKENS, int(ctx_size() * 0.68))
 
     system_prompt = messages[0] if messages[0].get("role") == "system" else None
     rest = messages[1:] if system_prompt is not None else messages

@@ -3,7 +3,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import "highlight.js/styles/github-dark.css";
-import type { ChatMessage } from "../lib/api";
+import { attachmentUrl, type ChatMessage } from "../lib/api";
 
 /** <pre> wrapper that adds a Copy button to every code block. */
 function CodeBlock({ children }: { children?: ReactNode }) {
@@ -110,15 +110,41 @@ export default function Message({ message, isLast, streaming, onRegenerate, onEd
         </div>
       ) : (
         <div className="min-w-0 max-w-full overflow-hidden rounded-2xl bg-zinc-900 px-4 py-3 text-sm leading-relaxed text-zinc-100">
+          {message.attachments && message.attachments.length > 0 && (
+            <div className={`flex flex-wrap gap-2 ${message.content ? "mb-3" : ""}`}>
+              {message.attachments.map((a) =>
+                a.kind === "image" ? (
+                  <a key={a.id} href={attachmentUrl(a.id)} target="_blank" rel="noreferrer" title={a.name}>
+                    <img
+                      src={attachmentUrl(a.id)}
+                      alt={a.name}
+                      className="max-h-48 max-w-full rounded-lg border border-zinc-700 object-contain"
+                    />
+                  </a>
+                ) : (
+                  <a
+                    key={a.id}
+                    href={attachmentUrl(a.id)}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="flex items-center gap-2 rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-1.5 text-xs text-zinc-300 hover:bg-zinc-800"
+                  >
+                    <span>📄</span>
+                    <span className="max-w-[12rem] truncate">{a.name}</span>
+                  </a>
+                ),
+              )}
+            </div>
+          )}
           {waiting ? (
             <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-zinc-500" />
-          ) : (
+          ) : message.content ? (
             <div className="markdown">
               <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]} components={{ pre: CodeBlock }}>
                 {message.content}
               </ReactMarkdown>
             </div>
-          )}
+          ) : null}
         </div>
       )}
 

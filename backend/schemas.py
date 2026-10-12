@@ -38,6 +38,8 @@ class ChatRequest(BaseModel):
     regenerate: bool = False
     # Edit a user message: replace its text, drop everything after it, re-answer.
     edit_message_id: int | None = None
+    # Ids returned by POST /api/uploads, attached to the new user message.
+    attachments: list[str] = Field(default_factory=list, max_length=4)
     temperature: float | None = Field(None, ge=0.0, le=2.0)
     top_p: float | None = Field(None, ge=0.0, le=1.0)
     max_tokens: int | None = Field(None, ge=-1)

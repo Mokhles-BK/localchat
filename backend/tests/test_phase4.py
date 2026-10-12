@@ -87,7 +87,7 @@ def test_migration_adds_meta_column(tmp_path, monkeypatch):
     monkeypatch.setattr(storage, "DB_PATH", db)
     storage._conn = None
     msgs = storage.list_messages(1)
-    assert msgs == [{"id": 1, "role": "user", "content": "kept", "meta": None}]
+    assert msgs == [{"id": 1, "role": "user", "content": "kept", "meta": None, "attachments": []}]
 
 
 def test_edit_helpers():

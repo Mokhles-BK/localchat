@@ -86,16 +86,107 @@ def fit_estimate(size_bytes: int) -> str:
     return "too_big"
 
 
+def is_projector(name: str) -> bool:
+    """Vision projector files (mmproj-*.gguf) are not chat models."""
+    return "mmproj" in name.lower()
+
+
 def list_local() -> list[dict[str, Any]]:
+    """Chat models in data/models (projectors are listed separately)."""
     if not MODELS_DIR.exists():
         return []
     out = []
     for p in sorted(MODELS_DIR.glob("*.gguf")):
+        if is_projector(p.name):
+            continue
         size = p.stat().st_size
+        proj = find_projector(p.name)
         out.append(
-            {"name": p.name, "size_bytes": size, "quant": quant_of(p.name), "fit": fit_estimate(size)}
+            {
+                "name": p.name,
+                "size_bytes": size,
+                "quant": quant_of(p.name),
+                "fit": fit_estimate(size),
+                "projector": proj.name if proj else None,
+            }
         )
     return out
+
+
+def list_projectors() -> list[dict[str, Any]]:
+    if not MODELS_DIR.exists():
+        return []
+    return [
+        {"name": p.name, "size_bytes": p.stat().st_size}
+        for p in sorted(MODELS_DIR.glob("*.gguf"))
+        if is_projector(p.name)
+    ]
+
+
+def _stem(name: str) -> str:
+    """A file name reduced to its model identity (no quant, no 'mmproj')."""
+    s = name.lower().removesuffix(".gguf").replace("mmproj", "")
+    s = QUANT_RE.sub("", s)
+    return re.sub(r"[-_.\s]+", "-", s).strip("-")
+
+
+def find_projector(model_name: str) -> Optional[Path]:
+    """The vision projector to load with a model, or None for text-only.
+
+    Order: explicit choice (settings), then a projector downloaded from the same
+    Hugging Face repo, then one whose name contains the model's name."""
+    projectors = {p["name"]: p for p in list_projectors()}
+    if not projectors:
+        return None
+    pairs = app_settings.get("mmproj_pairs", {})
+    choice = pairs.get(model_name) if isinstance(pairs, dict) else None
+    if choice == "none":
+        return None
+    if choice in projectors:
+        return MODELS_DIR / choice
+    sources = app_settings.get("sources", {})
+    sources = sources if isinstance(sources, dict) else {}
+    repo = sources.get(model_name)
+    cands = [n for n in projectors if repo and sources.get(n) == repo]
+    if not cands:
+        stem = _stem(model_name)
+        cands = [n for n in projectors if stem and stem in _stem(n)]
+    if not cands:
+        return None
+    cands.sort(
+        key=lambda n: (0 if "f16" in n.lower() and "bf16" not in n.lower() else 1, projectors[n]["size_bytes"])
+    )
+    return MODELS_DIR / cands[0]
+
+
+def vision_args(model_name: str) -> list[str]:
+    """Extra llama-server arguments that enable image input for this model."""
+    proj = find_projector(model_name)
+    if proj is None:
+        return []
+    args = ["--mmproj", str(proj)]
+    if os.environ.get("LLAMA_MMPROJ_CPU") == "1":
+        args.append("--no-mmproj-offload")  # keep the projector off the GPU (saves VRAM)
+    return args
+
+
+def set_pair(model_name: str, projector: str) -> None:
+    """projector: 'auto', 'none' or a projector file name."""
+    pairs = app_settings.get("mmproj_pairs", {})
+    pairs = dict(pairs) if isinstance(pairs, dict) else {}
+    if projector == "auto":
+        pairs.pop(model_name, None)
+    else:
+        pairs[model_name] = projector
+    app_settings.set_value("mmproj_pairs", pairs)
+
+
+def record_source(filename: str, repo_id: str) -> None:
+    """Remember which Hugging Face repo a file came from (used to pair projectors)."""
+    sources = app_settings.get("sources", {})
+    sources = dict(sources) if isinstance(sources, dict) else {}
+    sources[filename] = repo_id
+    app_settings.set_value("sources", sources)
 
 
 def safe_model_path(name: str) -> Path:
@@ -128,7 +219,7 @@ def default_model() -> Path:
             return safe_model_path(saved)
         except (ValueError, FileNotFoundError):
             pass  # saved model was deleted — fall back
-    candidates = sorted(MODELS_DIR.glob("*.gguf"))
+    candidates = [p for p in sorted(MODELS_DIR.glob("*.gguf")) if not is_projector(p.name)]
     if not candidates:
         raise RuntimeError(f"no .gguf models in {MODELS_DIR}")
     for pref in ("Q4_K_M", "Q4_K_S", "Q4_0"):
@@ -199,9 +290,9 @@ def list_repo_files(repo_id: str) -> list[dict[str, Any]]:
             continue
         size = (e.get("lfs") or {}).get("size", e.get("size", 0)) or 0
         split = bool(SPLIT_RE.search(path))
-        mmproj = "mmproj" in path.lower()
+        mmproj = is_projector(path)
         note = "split into several files (not supported yet)" if split else (
-            "vision projector, not a chat model" if mmproj else None
+            "vision projector: download it next to a vision model" if mmproj else None
         )
         out.append(
             {
@@ -209,8 +300,9 @@ def list_repo_files(repo_id: str) -> list[dict[str, Any]]:
                 "size_bytes": size,
                 "quant": quant_of(path),
                 "fit": fit_estimate(size),
-                "installed": path in installed,
-                "downloadable": not split and not mmproj and bool(FILE_RE.match(path)),
+                "kind": "projector" if mmproj else "model",
+                "installed": path in installed or (mmproj and (MODELS_DIR / path).exists()),
+                "downloadable": not split and bool(FILE_RE.match(path)),
                 "note": note,
             }
         )
@@ -251,6 +343,7 @@ def _dest_name(display: str) -> str:
 def _candidate(path: Path, name: str, source: str) -> dict[str, Any]:
     size = path.stat().st_size
     return {
+        "kind": "projector" if is_projector(name) else "model",
         "path": str(path),
         "name": name,
         "size_bytes": size,
@@ -273,7 +366,9 @@ def _scan_ollama() -> list[dict[str, Any]]:
             continue
         for layer in data.get("layers", []) if isinstance(data, dict) else []:
             digest = str(layer.get("digest", ""))
-            if not str(layer.get("mediaType", "")).endswith("image.model") or not DIGEST_RE.match(digest):
+            media = str(layer.get("mediaType", ""))
+            is_proj = media.endswith("image.projector")
+            if not (media.endswith("image.model") or is_proj) or not DIGEST_RE.match(digest):
                 continue
             blob = blobs / digest.replace(":", "-")
             if not (blob.is_file() and is_gguf(blob)):
@@ -281,7 +376,8 @@ def _scan_ollama() -> list[dict[str, Any]]:
             parts = list(mf.relative_to(manifests).parts)[1:]  # drop registry host
             if parts and parts[0] == "library":
                 parts = parts[1:]
-            out.append(_candidate(blob, _dest_name("-".join(parts)), "ollama"))
+            display = "-".join(parts)
+            out.append(_candidate(blob, _dest_name(f"mmproj-{display}" if is_proj else display), "ollama"))
     return out
 
 
@@ -293,7 +389,7 @@ def _scan_dir(folder: Path, source: str) -> list[dict[str, Any]]:
     files = (p for p in folder.rglob("*.gguf") if p.is_file())
     for p in itertools.islice(files, MAX_SCAN_FILES):
         low = p.name.lower()
-        if "mmproj" in low or SPLIT_RE.search(low) or ours in p.resolve().parents:
+        if SPLIT_RE.search(low) or ours in p.resolve().parents:
             continue
         if is_gguf(p):
             out.append(_candidate(p, p.name, source))
@@ -354,8 +450,8 @@ def start_download(repo_id: str, filename: str, *, threaded: bool = True) -> Dow
         raise ValueError("invalid repo id")
     if not FILE_RE.match(filename or "") or Path(filename).name != filename:
         raise ValueError("invalid file name")
-    if SPLIT_RE.search(filename) or "mmproj" in filename.lower():
-        raise ValueError("this file cannot be used as a chat model")
+    if SPLIT_RE.search(filename):
+        raise ValueError("this file cannot be used (split into several parts)")
     with _jobs_lock:
         for job in _jobs.values():
             if job.filename == filename and job.status in ACTIVE:
@@ -417,6 +513,7 @@ def _run_download(job: DownloadJob) -> None:
         if job.total and part.stat().st_size != job.total:
             raise OSError("download incomplete, try again to resume")
         os.replace(part, dest)
+        record_source(job.filename, job.repo_id)
         job.status = "done"
     except Exception as exc:  # noqa: BLE001 - reported to the UI
         job.status = "error"
@@ -434,8 +531,8 @@ def start_import(path: str, name: Optional[str] = None, *, threaded: bool = True
     filename = _dest_name(name) if name else source.name
     if not FILE_RE.match(filename) or Path(filename).name != filename:
         raise ValueError("invalid file name")
-    if SPLIT_RE.search(filename) or "mmproj" in filename.lower():
-        raise ValueError("this file cannot be used as a chat model")
+    if SPLIT_RE.search(filename):
+        raise ValueError("this file cannot be used (split into several parts)")
     with _jobs_lock:
         for job in _jobs.values():
             if job.filename == filename and job.status in ACTIVE:

@@ -89,6 +89,9 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(messages)")}
     if "meta" not in cols:
         conn.execute("ALTER TABLE messages ADD COLUMN meta TEXT")
+    # Phase 5: attachments (images / text files) as a JSON list.
+    if "attachments" not in cols:
+        conn.execute("ALTER TABLE messages ADD COLUMN attachments TEXT")
     conn.commit()
 
 
@@ -184,7 +187,7 @@ def list_messages(conv_id: int) -> list[dict]:
     messages share the same second (created_at is only second-resolution)."""
     conn = _get_conn()
     rows = conn.execute(
-        "SELECT id, role, content, meta FROM messages WHERE conversation_id = ? ORDER BY created_at ASC, id ASC",
+        "SELECT id, role, content, meta, attachments FROM messages WHERE conversation_id = ? ORDER BY created_at ASC, id ASC",
         (conv_id,),
     ).fetchall()
     return [_message_dict(r) for r in rows]
@@ -197,24 +200,49 @@ def _message_dict(row: sqlite3.Row) -> dict:
             meta = json.loads(row["meta"])
         except ValueError:
             meta = None
-    return {"id": row["id"], "role": row["role"], "content": row["content"], "meta": meta}
+    attachments: list = []
+    if row["attachments"]:
+        try:
+            attachments = json.loads(row["attachments"])
+        except ValueError:
+            attachments = []
+    return {
+        "id": row["id"],
+        "role": row["role"],
+        "content": row["content"],
+        "meta": meta,
+        "attachments": attachments,
+    }
 
 
-def add_message(conv_id: int, role: str, content: str, meta: Optional[dict] = None) -> dict:
+def add_message(
+    conv_id: int,
+    role: str,
+    content: str,
+    meta: Optional[dict] = None,
+    attachments: Optional[list] = None,
+) -> dict:
     conn = _get_conn()
     now = int(time.time())
     cur = conn.execute(
-        "INSERT INTO messages (conversation_id, role, content, created_at, meta) VALUES (?, ?, ?, ?, ?)",
-        (conv_id, role, content, now, json.dumps(meta) if meta else None),
+        "INSERT INTO messages (conversation_id, role, content, created_at, meta, attachments) VALUES (?, ?, ?, ?, ?, ?)",
+        (conv_id, role, content, now, json.dumps(meta) if meta else None, json.dumps(attachments) if attachments else None),
     )
     conn.commit()
-    return {"id": cur.lastrowid, "conversation_id": conv_id, "role": role, "content": content, "meta": meta}
+    return {
+        "id": cur.lastrowid,
+        "conversation_id": conv_id,
+        "role": role,
+        "content": content,
+        "meta": meta,
+        "attachments": attachments or [],
+    }
 
 
 def get_message(msg_id: int) -> Optional[dict]:
     conn = _get_conn()
     row = conn.execute(
-        "SELECT id, conversation_id, role, content, meta FROM messages WHERE id = ?", (msg_id,)
+        "SELECT id, conversation_id, role, content, meta, attachments FROM messages WHERE id = ?", (msg_id,)
     ).fetchone()
     if row is None:
         return None
@@ -259,8 +287,8 @@ def fork_conversation(conv_id: int, up_to_message_id: int) -> Optional[dict]:
     )
     conn.execute(
         """
-        INSERT INTO messages (conversation_id, role, content, created_at, meta)
-        SELECT ?, role, content, created_at, meta FROM messages
+        INSERT INTO messages (conversation_id, role, content, created_at, meta, attachments)
+        SELECT ?, role, content, created_at, meta, attachments FROM messages
         WHERE conversation_id = ? AND id <= ?
         ORDER BY created_at ASC, id ASC
         """,
@@ -268,6 +296,20 @@ def fork_conversation(conv_id: int, up_to_message_id: int) -> Optional[dict]:
     )
     conn.commit()
     return new
+
+
+def referenced_attachment_ids() -> set[str]:
+    """Ids of every attachment used by any saved message."""
+    conn = _get_conn()
+    ids: set[str] = set()
+    for (raw,) in conn.execute("SELECT attachments FROM messages WHERE attachments IS NOT NULL"):
+        try:
+            for a in json.loads(raw):
+                if isinstance(a, dict) and "id" in a:
+                    ids.add(a["id"])
+        except ValueError:
+            continue
+    return ids
 
 
 def _like_pattern(q: str) -> str:

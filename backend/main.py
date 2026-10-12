@@ -29,6 +29,8 @@ import model_manager
 from llama_server import LlamaServer
 from routes_conversations import router, search_router
 from routes_models import router as models_router
+from routes_uploads import router as uploads_router
+import uploads
 from schemas import ChatRequest
 import storage
 from chat_service import build_context, effective_settings, reply_meta
@@ -64,7 +66,13 @@ def _model_status() -> dict[str, Any]:
         "models_dir": str(MODELS_DIR),
         "exists": MODELS_DIR.exists(),
         "models": model_manager.list_local(),
+        "projectors": model_manager.list_projectors(),
     }
+
+
+def _has_vision(server) -> bool:
+    """True when the running llama-server was started with a vision projector."""
+    return server is not None and "--mmproj" in getattr(server, "extra_args", [])
 
 
 def _close_current() -> None:
@@ -108,6 +116,7 @@ async def lifespan(app: FastAPI):
             host="127.0.0.1",
             port=8080,
             n_gpu_layers=model_manager.gpu_layers_for(model.name),
+            extra_args=model_manager.vision_args(model.name),
         )
         _install_exit_handlers()
         _server.start()
@@ -115,6 +124,11 @@ async def lifespan(app: FastAPI):
         _close_current()
         _server = None
         print(f"[startup] llama-server failed to start: {exc!r}", flush=True)
+    # Remove uploads left behind by deleted chats or abandoned attachments.
+    try:
+        uploads.purge_unreferenced(storage.referenced_attachment_ids())
+    except Exception as exc:  # noqa: BLE001 - housekeeping must never block startup
+        print(f"[startup] upload clean-up skipped: {exc!r}", flush=True)
     yield
     _close_current()
     storage.close()
@@ -123,13 +137,15 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="LocalChat", version="0.3.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    # Only the Vite dev UI may call the API from a browser (it is a local app).
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 app.include_router(router)
 app.include_router(search_router)
 app.include_router(models_router)
+app.include_router(uploads_router)
 
 
 # --------------------------------------------------------------------------- #
@@ -154,6 +170,7 @@ def health() -> dict[str, Any]:
         "model": _server.model.name if _server else None,
         "loading_model": _loading_model,
         "ctx_size": ctx_size(),
+        "vision": _has_vision(_server),
         "log_file": str(_server.log_path) if _server else None,
         **_model_status(),
     }
@@ -205,21 +222,34 @@ async def chat(req: ChatRequest) -> StreamingResponse:
             raise HTTPException(status_code=400, detail="content is required")
         storage.update_message_content(target["id"], req.content)
         storage.delete_messages_after(req.conversation_id, target["id"])
+        uploads.purge_unreferenced(storage.referenced_attachment_ids())
     elif req.regenerate:
         # Re-answer from the stored history; needs an assistant reply to drop.
         if not any(m["role"] == "assistant" for m in storage.list_messages(req.conversation_id)):
             raise HTTPException(status_code=400, detail="nothing to regenerate")
         storage.delete_last_assistant_message(req.conversation_id)
     else:
-        if not req.content.strip():
+        attached: list[dict] = []
+        for att_id in req.attachments:
+            meta = uploads.get_meta(att_id)
+            if meta is None:
+                raise HTTPException(status_code=400, detail="unknown attachment")
+            attached.append(meta)
+        if not req.content.strip() and not attached:
             raise HTTPException(status_code=400, detail="content is required")
+        if any(a["kind"] == "image" for a in attached) and not _has_vision(server):
+            raise HTTPException(
+                status_code=400,
+                detail="the loaded model cannot read images; load a vision model (Models page)",
+            )
         # Save the user message BEFORE streaming so it survives a cancel.
-        storage.add_message(req.conversation_id, "user", req.content)
+        storage.add_message(req.conversation_id, "user", req.content, attachments=attached or None)
+        uploads.mark_attached(req.attachments)
         if not conv["title"]:
-            storage.auto_title(req.conversation_id, req.content)
+            storage.auto_title(req.conversation_id, req.content or attached[0]["name"])
 
     history = storage.list_messages(req.conversation_id)
-    messages = build_context(conv, history, None)
+    messages = build_context(conv, history, None, vision=_has_vision(server))
 
     async def event_generator():
         sink: list[str] = []

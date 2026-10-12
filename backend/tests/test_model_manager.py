@@ -115,7 +115,8 @@ def test_list_repo_files_filters_and_flags(monkeypatch, isolated_models):
     assert by_name["m-Q4_K_M.gguf"]["size_bytes"] == 2_000_000_000
     assert by_name["m-Q8_0.gguf"]["downloadable"] is True
     assert by_name["big-00001-of-00003.gguf"]["downloadable"] is False
-    assert by_name["mmproj-F16.gguf"]["downloadable"] is False
+    assert by_name["mmproj-F16.gguf"]["downloadable"] is True  # vision projectors can be downloaded
+    assert by_name["mmproj-F16.gguf"]["kind"] == "projector" and by_name["m-Q8_0.gguf"]["kind"] == "model"
     assert [f["size_bytes"] for f in files] == sorted(f["size_bytes"] for f in files)
 
 

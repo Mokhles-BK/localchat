@@ -9,7 +9,16 @@ export interface MessageMeta {
   tps?: number;
 }
 
+export interface Attachment {
+  id: string;
+  name: string;
+  mime: string;
+  kind: "image" | "text";
+  size: number;
+}
+
 export interface ChatMessage {
+  attachments?: Attachment[];
   id?: number; // missing only while a message is still being created
   role: "system" | "user" | "assistant";
   content: string;
@@ -50,6 +59,12 @@ export interface ModelInfo {
   size_bytes: number;
   quant?: string | null;
   fit?: Fit;
+  projector?: string | null; // vision projector loaded with this model, if any
+}
+
+export interface Projector {
+  name: string;
+  size_bytes: number;
 }
 
 export interface RepoResult {
@@ -59,6 +74,7 @@ export interface RepoResult {
 }
 
 export interface RepoFile {
+  kind: "model" | "projector";
   filename: string;
   size_bytes: number;
   quant: string | null;
@@ -69,6 +85,7 @@ export interface RepoFile {
 }
 
 export interface LocalCandidate {
+  kind: "model" | "projector";
   path: string;
   name: string;
   size_bytes: number;
@@ -101,6 +118,7 @@ export interface HealthResponse {
   model: string | null;
   loading_model: string | null;
   ctx_size: number;
+  vision: boolean;
   models_dir: string;
   exists: boolean;
   models: ModelInfo[];
@@ -111,6 +129,7 @@ export interface StreamRequest {
   content?: string;
   regenerate?: boolean;
   edit_message_id?: number;
+  attachments?: string[];
 }
 
 const BASE = "/api";
@@ -211,7 +230,16 @@ export const api = {
     (await request<{ results: SearchHit[] }>("GET", `/search?q=${encodeURIComponent(q)}`)).results,
   forkConversation: (id: number, upToMessageId: number) =>
     request<Conversation>("POST", `/conversations/${id}/fork`, { up_to_message_id: upToMessageId }),
-  listModels: async () => (await request<{ models: ModelInfo[] }>("GET", "/models")).models,
+  listModels: async () => {
+    const r = await request<{ models: ModelInfo[]; projectors: Projector[] }>("GET", "/models");
+    return { models: r.models, projectors: r.projectors ?? [] };
+  },
+  pairModel: (model: string, projector: string) =>
+    request<{ model: string; projector: string | null; restart_needed: boolean }>("POST", "/models/pair", {
+      model,
+      projector,
+    }),
+  uploadFile,
   searchRepos: async (q: string) =>
     (await request<{ results: RepoResult[] }>("GET", `/models/search?q=${encodeURIComponent(q)}`)).results,
   repoFiles: async (repoId: string) =>
@@ -231,10 +259,56 @@ export const api = {
     (await request<{ downloads: DownloadJob[] }>("GET", "/models/downloads")).downloads,
   cancelDownload: (id: string) => request<void>("DELETE", `/models/downloads/${id}`),
   activateModel: (name: string) =>
-    request<{ model: string }>("POST", "/models/activate", { name }),
+    request<{ model: string; vision: boolean; warning: string | null }>("POST", "/models/activate", { name }),
   deleteModel: (name: string) => request<void>("DELETE", `/models/${encodeURIComponent(name)}`),
 };
 
 /** Download link for a conversation export (the browser handles the file). */
 export const exportUrl = (id: number, format: "md" | "json") =>
   `${BASE}/conversations/${id}/export?format=${format}`;
+
+export const attachmentUrl = (id: string) => `${BASE}/uploads/${id}`;
+
+const MAX_IMAGE_SIDE = 1280;
+
+/** Shrink big photos before upload: smaller upload, fewer image tokens, faster. */
+async function prepareImage(file: File): Promise<{ blob: Blob; name: string }> {
+  if (!file.type.startsWith("image/") || file.type === "image/gif") return { blob: file, name: file.name };
+  try {
+    const bmp = await createImageBitmap(file);
+    const scale = Math.min(1, MAX_IMAGE_SIDE / Math.max(bmp.width, bmp.height));
+    if (scale === 1 && file.size < 1_500_000) {
+      bmp.close();
+      return { blob: file, name: file.name };
+    }
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.round(bmp.width * scale);
+    canvas.height = Math.round(bmp.height * scale);
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return { blob: file, name: file.name };
+    ctx.fillStyle = "#fff"; // JPEG has no transparency
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(bmp, 0, 0, canvas.width, canvas.height);
+    bmp.close();
+    const blob = await new Promise<Blob | null>((r) => canvas.toBlob(r, "image/jpeg", 0.85));
+    if (!blob) return { blob: file, name: file.name };
+    return { blob, name: file.name.replace(/\.[^.]+$/, "") + ".jpg" };
+  } catch {
+    return { blob: file, name: file.name };
+  }
+}
+
+function toBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(",")[1] ?? "");
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
+}
+
+/** Upload an image or text/code file; returns the attachment to send with a message. */
+export async function uploadFile(file: File): Promise<Attachment> {
+  const { blob, name } = await prepareImage(file);
+  return request<Attachment>("POST", "/uploads", { name, data_base64: await toBase64(blob) });
+}

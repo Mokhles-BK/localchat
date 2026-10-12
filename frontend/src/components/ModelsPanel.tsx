@@ -6,12 +6,14 @@ import {
   type Fit,
   type LocalCandidate,
   type ModelInfo,
+  type Projector,
   type RepoFile,
   type RepoResult,
 } from "../lib/api";
 
 interface Props {
   activeModel: string | null;
+  activeVision: boolean;
   onClose: () => void;
   onModelChanged: () => void;
 }
@@ -30,8 +32,10 @@ function FitBadge({ fit }: { fit?: Fit }) {
 const isActive = (j: DownloadJob) => j.status === "queued" || j.status === "downloading";
 const isArmOnly = (name: string) => /Q4_0_\d_\d/i.test(name);
 
-export default function ModelsPanel({ activeModel, onClose, onModelChanged }: Props) {
+export default function ModelsPanel({ activeModel, activeVision, onClose, onModelChanged }: Props) {
   const [local, setLocal] = useState<ModelInfo[]>([]);
+  const [projectors, setProjectors] = useState<Projector[]>([]);
+  const [notice, setNotice] = useState<string | null>(null);
   const [jobs, setJobs] = useState<DownloadJob[]>([]);
   const [dismissed, setDismissed] = useState<Set<string>>(new Set());
   const [q, setQ] = useState("");
@@ -51,7 +55,9 @@ export default function ModelsPanel({ activeModel, onClose, onModelChanged }: Pr
 
   async function refreshLocal() {
     try {
-      setLocal(await api.listModels());
+      const r = await api.listModels();
+      setLocal(r.models);
+      setProjectors(r.projectors);
     } catch (e) {
       fail(e);
     }
@@ -165,7 +171,8 @@ export default function ModelsPanel({ activeModel, onClose, onModelChanged }: Pr
     setSwitching(name);
     setError(null);
     try {
-      await api.activateModel(name);
+      const r = await api.activateModel(name);
+      if (r.warning) setNotice(r.warning);
       onModelChanged();
     } catch (e) {
       fail(e);
@@ -173,6 +180,17 @@ export default function ModelsPanel({ activeModel, onClose, onModelChanged }: Pr
     } finally {
       setSwitching(null);
       void refreshLocal();
+    }
+  }
+
+  async function pair(model: string, projector: string) {
+    setError(null);
+    try {
+      const r = await api.pairModel(model, projector);
+      setNotice(r.restart_needed ? "Vision setting saved. Press Use on this model again to apply it." : null);
+      await refreshLocal();
+    } catch (e) {
+      fail(e);
     }
   }
 
@@ -206,6 +224,12 @@ export default function ModelsPanel({ activeModel, onClose, onModelChanged }: Pr
             <div className="rounded-xl border border-red-800/60 bg-red-950/40 px-4 py-3 text-sm text-red-300">{error}</div>
           )}
 
+          {notice && (
+            <div className="rounded-xl border border-amber-800/60 bg-amber-950/30 px-4 py-3 text-sm text-amber-300">
+              {notice}
+            </div>
+          )}
+
           {switching && (
             <div className="rounded-xl border border-emerald-800/60 bg-emerald-950/30 px-4 py-3 text-sm text-emerald-300">
               Loading {switching}… this takes 10 to 60 seconds. Chat is paused until it is ready.
@@ -227,10 +251,30 @@ export default function ModelsPanel({ activeModel, onClose, onModelChanged }: Pr
                         <span>{formatBytes(m.size_bytes)}</span>
                         {m.quant && <span>{m.quant}</span>}
                         <FitBadge fit={m.fit} />
+                        {m.projector && <span className="rounded bg-sky-950 px-1.5 py-0.5 text-[10px] text-sky-300">vision</span>}
                       </div>
+                      {projectors.length > 0 && (
+                        <select
+                          value={m.projector ?? "none"}
+                          onChange={(e) => void pair(m.name, e.target.value)}
+                          disabled={switching !== null}
+                          title="Vision projector used with this model"
+                          className="mt-1 max-w-full rounded border border-zinc-700 bg-zinc-950 px-1 py-0.5 text-[11px] text-zinc-400"
+                        >
+                          <option value="auto">Vision: auto-detect</option>
+                          <option value="none">Vision: off (text only)</option>
+                          {projectors.map((p) => (
+                            <option key={p.name} value={p.name}>
+                              Vision: {p.name}
+                            </option>
+                          ))}
+                        </select>
+                      )}
                     </div>
                     {active ? (
-                      <span className="rounded-lg bg-emerald-900/50 px-2 py-1 text-xs text-emerald-300">Active</span>
+                      <span className="rounded-lg bg-emerald-900/50 px-2 py-1 text-xs text-emerald-300">
+                        Active{activeVision ? " · vision" : ""}
+                      </span>
                     ) : (
                       <>
                         <button
@@ -255,6 +299,28 @@ export default function ModelsPanel({ activeModel, onClose, onModelChanged }: Pr
               })}
             </div>
           </section>
+
+          {projectors.length > 0 && (
+            <section>
+              <h3 className="mb-2 text-xs font-medium uppercase tracking-wide text-zinc-500">Vision projectors</h3>
+              <div className="grid gap-1">
+                {projectors.map((p) => (
+                  <div key={p.name} className="flex items-center gap-3 rounded-lg px-3 py-1.5 hover:bg-zinc-900">
+                    <span className="min-w-0 flex-1 truncate text-sm text-zinc-300">{p.name}</span>
+                    <span className="text-xs text-zinc-500">{formatBytes(p.size_bytes)}</span>
+                    <button
+                      onClick={() => void remove(p.name)}
+                      disabled={switching !== null}
+                      title="Delete from disk"
+                      className="rounded px-1 text-xs text-zinc-500 hover:text-red-400 disabled:opacity-40"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
 
           {/* Active downloads */}
           {visibleJobs.length > 0 && (
@@ -345,7 +411,11 @@ export default function ModelsPanel({ activeModel, onClose, onModelChanged }: Pr
                           <span>{sourceLabel[c.source]}</span>
                           <span>{formatBytes(c.size_bytes)}</span>
                           {c.quant && <span>{c.quant}</span>}
-                          <FitBadge fit={c.fit} />
+                          {c.kind === "projector" ? (
+                            <span className="rounded bg-sky-950 px-1.5 py-0.5 text-[10px] text-sky-300">vision projector</span>
+                          ) : (
+                            <FitBadge fit={c.fit} />
+                          )}
                         </div>
                       </div>
                       {have ? (
@@ -369,6 +439,10 @@ export default function ModelsPanel({ activeModel, onClose, onModelChanged }: Pr
           {/* Hugging Face */}
           <section>
             <h3 className="mb-2 text-xs font-medium uppercase tracking-wide text-zinc-500">Download from Hugging Face</h3>
+            <p className="mb-2 text-xs text-zinc-600">
+              For images, download a vision model (try searching "smolvlm2" or "gemma 3 4b it") and also the file whose
+              name starts with <code>mmproj</code> from the same repo. They are paired automatically.
+            </p>
             <div className="flex gap-2">
               <input
                 value={q}
@@ -429,7 +503,11 @@ export default function ModelsPanel({ activeModel, onClose, onModelChanged }: Pr
                           <div className="mt-0.5 flex flex-wrap items-center gap-2 text-xs text-zinc-500">
                             <span>{formatBytes(f.size_bytes)}</span>
                             {f.quant && <span>{f.quant}</span>}
-                            <FitBadge fit={f.fit} />
+                            {f.kind === "projector" ? (
+                              <span className="rounded bg-sky-950 px-1.5 py-0.5 text-[10px] text-sky-300">vision projector</span>
+                            ) : (
+                              <FitBadge fit={f.fit} />
+                            )}
                             {arm && <span className="text-amber-500">ARM-only format</span>}
                             {f.note && <span>{f.note}</span>}
                           </div>

@@ -9,6 +9,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
 
 import storage
+import uploads
 from schemas import ConversationCreate, ConversationUpdate, ForkRequest
 
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
@@ -54,6 +55,8 @@ def update_conversation_endpoint(conv_id: int, body: ConversationUpdate):
 def delete_conversation_endpoint(conv_id: int):
     if not storage.delete_conversation(conv_id):
         raise HTTPException(status_code=404, detail="conversation not found")
+    # Do not leave the deleted chat's images / files on disk.
+    uploads.purge_unreferenced(storage.referenced_attachment_ids())
 
 
 @router.get("/{conv_id}/messages")

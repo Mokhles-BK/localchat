@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   api,
+  type Attachment,
   type ChatMessage,
   type Conversation,
   type ConversationPatch,
@@ -20,6 +21,19 @@ const DEFAULT_SETTINGS: ConversationSettings = {
   max_tokens: -1,
 };
 
+interface PendingFile {
+  key: string;
+  name: string;
+  status: "uploading" | "ready" | "error";
+  attachment?: Attachment;
+  preview?: string; // object URL for image thumbnails
+  error?: string;
+}
+
+const MAX_ATTACHMENTS = 4;
+const ACCEPT =
+  "image/png,image/jpeg,image/webp,image/gif,text/*,.md,.py,.js,.jsx,.ts,.tsx,.json,.csv,.html,.css,.java,.c,.h,.cpp,.cs,.go,.rs,.sql,.sh,.ps1,.yml,.yaml,.xml,.log,.toml,.ini";
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export default function App() {
@@ -33,6 +47,9 @@ export default function App() {
   const [loadingModel, setLoadingModel] = useState<string | null>(null);
   const [modelsOpen, setModelsOpen] = useState(false);
   const [ctxSize, setCtxSize] = useState<number | null>(null);
+  const [vision, setVision] = useState(false);
+  const [pending, setPending] = useState<PendingFile[]>([]);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const [error, setError] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -89,6 +106,7 @@ export default function App() {
       setModel(h.model);
       setLoadingModel(h.loading_model);
       setCtxSize(h.ctx_size ?? null);
+      setVision(!!h.vision);
     } catch (e) {
       setError((e as Error).message);
     }
@@ -128,7 +146,7 @@ export default function App() {
   /** Stream a reply into conversation `convId`, then re-sync with the database. */
   async function runStream(
     convId: number,
-    body: { content?: string; regenerate?: boolean; edit_message_id?: number },
+    body: { content?: string; regenerate?: boolean; edit_message_id?: number; attachments?: string[] },
   ) {
     const controller = new AbortController();
     abortRef.current = controller;
@@ -172,9 +190,51 @@ export default function App() {
     inputRef.current?.focus();
   }
 
+  /** Upload picked / pasted / dropped files and show them as chips above the composer. */
+  async function addFiles(files: File[]) {
+    setError(null);
+    for (const file of files) {
+      if (pending.length + 1 > MAX_ATTACHMENTS) {
+        setError(`At most ${MAX_ATTACHMENTS} attachments per message.`);
+        break;
+      }
+      if (file.type.startsWith("image/") && !vision) {
+        setError("The loaded model cannot read images. Open the model menu and load a vision model first.");
+        continue;
+      }
+      const key = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const preview = file.type.startsWith("image/") ? URL.createObjectURL(file) : undefined;
+      setPending((p) => [...p, { key, name: file.name || "pasted image", status: "uploading", preview }]);
+      try {
+        const attachment = await api.uploadFile(file);
+        setPending((p) => p.map((x) => (x.key === key ? { ...x, status: "ready", attachment } : x)));
+      } catch (e) {
+        setPending((p) => p.map((x) => (x.key === key ? { ...x, status: "error", error: (e as Error).message } : x)));
+      }
+    }
+  }
+
+  function removePending(key: string) {
+    setPending((p) => {
+      const gone = p.find((x) => x.key === key);
+      if (gone?.preview) URL.revokeObjectURL(gone.preview);
+      return p.filter((x) => x.key !== key);
+    });
+  }
+
+  function onPaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
+    const files = Array.from(e.clipboardData.files);
+    if (files.length > 0) {
+      e.preventDefault();
+      void addFiles(files);
+    }
+  }
+
   async function send() {
     const text = input.trim();
-    if (!text || busy || loadingModel) return;
+    const ready = pending.filter((x) => x.status === "ready" && x.attachment).map((x) => x.attachment!);
+    const uploading = pending.some((x) => x.status === "uploading");
+    if ((!text && ready.length === 0) || uploading || busy || loadingModel) return;
     setError(null);
 
     let convId = activeIdRef.current;
@@ -190,8 +250,14 @@ export default function App() {
       }
     }
     setInput("");
-    setMessages((m) => [...m, { role: "user", content: text }, { role: "assistant", content: "" }]);
-    await runStream(convId, { content: text });
+    pending.forEach((x) => x.preview && URL.revokeObjectURL(x.preview));
+    setPending([]);
+    setMessages((m) => [
+      ...m,
+      { role: "user", content: text, attachments: ready },
+      { role: "assistant", content: "" },
+    ]);
+    await runStream(convId, { content: text, attachments: ready.map((a) => a.id) });
   }
 
   async function regenerate() {
@@ -356,7 +422,8 @@ export default function App() {
               title="Manage models"
               className="max-w-[16rem] truncate rounded-md px-2 py-1 text-xs text-zinc-400 hover:bg-zinc-900 hover:text-zinc-100"
             >
-              {loadingModel ? `loading ${loadingModel}…` : (model ?? "no model")} ▾
+              {loadingModel ? `loading ${loadingModel}…` : (model ?? "no model")}
+              {vision && !loadingModel ? " · 👁" : ""} ▾
             </button>
             <button
               onClick={() => setSettingsOpen((v) => !v)}
@@ -398,13 +465,64 @@ export default function App() {
           </div>
         </div>
 
-        <div className="border-t border-zinc-800 px-4 py-4">
+        <div
+          className="border-t border-zinc-800 px-4 py-4"
+          onDragOver={(e) => e.preventDefault()}
+          onDrop={(e) => {
+            e.preventDefault();
+            void addFiles(Array.from(e.dataTransfer.files));
+          }}
+        >
+          {pending.length > 0 && (
+            <div className="mx-auto mb-2 flex w-full max-w-2xl flex-wrap gap-2">
+              {pending.map((x) => (
+                <div
+                  key={x.key}
+                  title={x.error ?? x.name}
+                  className={`flex items-center gap-2 rounded-xl border px-2 py-1 text-xs ${
+                    x.status === "error" ? "border-red-800 text-red-300" : "border-zinc-700 text-zinc-300"
+                  }`}
+                >
+                  {x.preview ? (
+                    <img src={x.preview} alt="" className="h-8 w-8 rounded object-cover" />
+                  ) : (
+                    <span>📄</span>
+                  )}
+                  <span className="max-w-[10rem] truncate">{x.name}</span>
+                  {x.status === "uploading" && <span className="text-zinc-500">…</span>}
+                  {x.status === "error" && <span className="max-w-[12rem] truncate">{x.error}</span>}
+                  <button onClick={() => removePending(x.key)} className="text-zinc-500 hover:text-zinc-200">
+                    ✕
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
           <div className="mx-auto flex w-full max-w-2xl items-end gap-2">
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              accept={ACCEPT}
+              className="hidden"
+              onChange={(e) => {
+                void addFiles(Array.from(e.target.files ?? []));
+                e.target.value = "";
+              }}
+            />
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              title="Attach images, text or code files (you can also paste or drop them)"
+              className="rounded-2xl border border-zinc-700 px-3 py-3 text-sm text-zinc-300 hover:bg-zinc-900"
+            >
+              📎
+            </button>
             <textarea
               ref={inputRef}
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={onKeyDown}
+              onPaste={onPaste}
               placeholder="Send a message…  (Enter to send, Shift+Enter for newline)"
               rows={1}
               className="flex-1 resize-none rounded-2xl border border-zinc-700 bg-zinc-900 px-4 py-3 text-sm text-zinc-100 outline-none focus:border-emerald-600 focus:ring-1 focus:ring-emerald-600"
@@ -419,7 +537,7 @@ export default function App() {
             ) : (
               <button
                 onClick={() => void send()}
-                disabled={!input.trim() || !!loadingModel}
+                disabled={(!input.trim() && !pending.some((x) => x.status === "ready")) || pending.some((x) => x.status === "uploading") || !!loadingModel}
                 className="rounded-2xl bg-emerald-600 px-4 py-3 text-sm font-semibold text-white hover:bg-emerald-500 disabled:opacity-40"
               >
                 Send
@@ -431,6 +549,7 @@ export default function App() {
       {modelsOpen && (
         <ModelsPanel
           activeModel={model}
+          activeVision={vision}
           onClose={() => setModelsOpen(false)}
           onModelChanged={() => void refreshHealth()}
         />
